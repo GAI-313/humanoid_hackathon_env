@@ -1,0 +1,28 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Python build / cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+*.whl
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# CycloneDDS / runtime logs
+cdds.LOG
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
