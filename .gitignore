@@ -26,3 +26,5 @@ cdds.LOG
 .DS_Store
 Thumbs.db
 
+# VSCode
+.vscode

@@ -8,17 +8,13 @@ version = "0.1.0"
 [tasks]
 verify-sdk = "python -c \"import cyclonedds, numpy, cv2, unitree_sdk2py; from unitree_sdk2py.core.channel import ChannelFactoryInitialize; print('unitree_sdk2py & cyclonedds loaded successfully!')\""
 sample-tts = "python samples/sample_tts.py"
+sample-walk = "python samples/sample_walk.py"
 
 [dependencies]
-python = ">=3.11,<3.13"
-cyclonedds = ">=11.0.1"
-cyclonedds-py = ">=11.0.1"
+python = "3.10.*"
 numpy = ">=1.26"
 opencv = ">=4.8"
 
-[pypi-options.dependency-overrides]
-cyclonedds = ">=0.10.2"
-
 [pypi-dependencies]
+cyclonedds = "==0.10.2"
 unitree_sdk2py = { git = "https://github.com/unitreerobotics/unitree_sdk2_python.git" }
-
