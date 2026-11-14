@@ -313,7 +313,7 @@ def add_recognizer_args(parser) -> None:
                         help="見た目の台帳 JSON(--gemini 用)")
     parser.add_argument("--gemini-model", type=str, default=None,
                         help="Gemini のモデル名(既定: 環境変数 GEMINI_MODEL、無ければ gemini-3.5-flash-lite)")
-    parser.add_argument("--gemini-timeout", type=float, default=8.0, help="Gemini の HTTP タイムアウト(秒)")
+    parser.add_argument("--gemini-timeout", type=float, default=20.0, help="Gemini の HTTP タイムアウト(秒)")
     parser.add_argument("--gemini-endpoint", type=str, default=None, help="Gemini のエンドポイント(テスト用)")
 
 
@@ -329,7 +329,7 @@ def recognizer_from_args(args, source, **extra):
             catalog = {}
         extra["verifier"] = GeminiVerifier(
             catalog, model=getattr(args, "gemini_model", None), endpoint=getattr(args, "gemini_endpoint", None),
-            timeout=getattr(args, "gemini_timeout", 8.0))
+            timeout=getattr(args, "gemini_timeout", 20.0))
     return Recognizer(
         source, zones=zones, server=getattr(args, "server", None),
         command_url=getattr(args, "command_url", None),

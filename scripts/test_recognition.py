@@ -667,7 +667,7 @@ def test_gemini_args():
     ap = argparse.ArgumentParser()
     rl.add_recognizer_args(ap)
     a = ap.parse_args([])
-    assert a.gemini is False and a.gemini_timeout == 8.0 and a.catalog.endswith("catalog.json")
+    assert a.gemini is False and a.gemini_timeout == 20.0 and a.catalog.endswith("catalog.json")
     assert rl.recognizer_from_args(a, None).verifier is None
     a = ap.parse_args(["--gemini", "--gemini-endpoint", "http://127.0.0.1:9/x"])
     with contextlib.redirect_stderr(io.StringIO()):

@@ -31,3 +31,5 @@ Thumbs.db
 
 # Dashboard event logs
 logs/
+work/
+.env
