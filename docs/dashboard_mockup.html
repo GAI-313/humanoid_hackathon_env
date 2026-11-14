@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ピックR1 ダッシュボード</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: 状態ヘッダーを最上段に、左=タイムライン / 右=マップ+集計の2カラム。右カラムは狭幅で下に回る。 */
+:root {
+  --bg: #eef1f5;
+  --surface: #ffffff;
+  --surface-2: #f5f7fa;
+  --line: #d8dee7;
+  --fg: #1a2230;
+  --muted: #5d6b7e;
+  --accent: #2f5fd0;
+  --s-idle: #6b778a;
+  --s-scan: #2f6fe0;
+  --s-move: #b7791f;
+  --s-done: #1f8a5b;
+  --s-err: #c63a3a;
+  --s-idle-bg: #e7ebf1;
+  --s-scan-bg: #dfe9fc;
+  --s-move-bg: #faecd0;
+  --s-done-bg: #d9f1e6;
+  --s-err-bg: #f9dede;
+  --font: "Noto Sans JP", "Hiragino Sans", "Yu Gothic UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 15px; line-height: 1.5; }
+.wrap { max-width: 1280px; margin: 0 auto; padding-block: 20px 40px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 16px; }
+.top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.top h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: .02em; }
+.top .sub { color: var(--muted); font-size: 13px; }
+.live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.live i { width: 8px; height: 8px; border-radius: 50%; background: var(--s-done); display: inline-block; }
+
+/* alert */
+.alert { background: var(--s-err-bg); color: var(--s-err); border: 1px solid var(--s-err); border-radius: 6px; padding: 12px 16px;
+  display: flex; align-items: center; gap: 12px; font-weight: 700; }
+.alert[hidden] { display: none; }
+.alert .msg { flex: 1; min-width: 0; }
+.alert button { font: inherit; font-size: 13px; background: transparent; color: inherit; border: 1px solid currentColor; border-radius: 4px; padding: 4px 10px; cursor: pointer; }
+
+/* status header */
+.status { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 20px 24px;
+  display: grid; grid-template-columns: auto 1fr; gap: 12px 32px; align-items: center; }
+.badge { display: inline-flex; align-items: center; gap: 12px; padding: 10px 22px; border-radius: 999px; font-size: 28px; font-weight: 700;
+  background: var(--s-idle-bg); color: var(--s-idle); transition: background .25s, color .25s; white-space: nowrap; }
+.badge::before { content: ""; width: 14px; height: 14px; border-radius: 50%; background: currentColor; }
+.status[data-state="scan"] .badge { background: var(--s-scan-bg); color: var(--s-scan); }
+.status[data-state="move"] .badge { background: var(--s-move-bg); color: var(--s-move); }
+.status[data-state="done"] .badge { background: var(--s-done-bg); color: var(--s-done); }
+.status[data-state="err"] .badge { background: var(--s-err-bg); color: var(--s-err); }
+.status[data-state="move"] .badge::before, .status[data-state="scan"] .badge::before { animation: pulse 1.1s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .25; } }
+.now { display: flex; gap: 32px; flex-wrap: wrap; }
+.kv { display: flex; flex-direction: column; min-width: 0; }
+.kv span { font-size: 12px; color: var(--muted); letter-spacing: .06em; }
+.kv b { font-family: var(--mono); font-size: 26px; font-weight: 600; }
+.kv b.zone { font-family: var(--font); }
+
+/* main grid */
+.grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px 20px; min-width: 0; }
+.panel h2 { margin: 0 0 12px; font-size: 13px; font-weight: 700; color: var(--muted); letter-spacing: .08em; display: flex; justify-content: space-between; align-items: center; }
+.panel h2 small { font-weight: 400; letter-spacing: 0; }
+
+/* timeline */
+.tl { list-style: none; margin: 0; padding: 0; max-height: 520px; overflow-y: auto; }
+.tl li { display: grid; grid-template-columns: 64px 82px 64px 44px 1fr; gap: 10px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); font-size: 14px; }
+.tl li:first-child { border-top: 0; }
+.tl li.new { animation: flash 1.2s ease-out; }
+@keyframes flash { from { background: var(--s-scan-bg); } to { background: transparent; } }
+.tl .t { font-family: var(--mono); font-size: 13px; color: var(--muted); }
+.tl .id { font-family: var(--mono); font-weight: 600; }
+.tl .detail { color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+.pill { display: inline-block; text-align: center; font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
+.pill.scanned { background: var(--s-scan-bg); color: var(--s-scan); }
+.pill.moving { background: var(--s-move-bg); color: var(--s-move); }
+.pill.arrived { background: var(--s-done-bg); color: var(--s-done); }
+.pill.error { background: var(--s-err-bg); color: var(--s-err); }
+.zonechip { font-weight: 700; }
+
+/* map */
+.map { width: 100%; height: auto; display: block; background: var(--surface-2); border-radius: 6px; }
+.map text { font-family: var(--font); fill: var(--fg); font-size: 13px; }
+.map .lbl { fill: var(--muted); font-size: 11px; }
+.map .zone { fill: var(--surface); stroke: var(--line); stroke-width: 2; stroke-dasharray: 6 4; }
+.map .zone.hot { stroke: var(--s-done); stroke-dasharray: none; fill: var(--s-done-bg); }
+.map .path { stroke: var(--line); stroke-width: 2; stroke-dasharray: 3 5; fill: none; }
+.map .start { fill: var(--surface); stroke: var(--muted); stroke-width: 2; }
+#robot { transition: transform 1.6s ease-in-out; }
+#robot .body { fill: var(--accent); }
+#robot .eye { fill: var(--surface); }
+
+/* stats */
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.stat { background: var(--surface-2); border-radius: 6px; padding: 12px 14px; }
+.stat span { font-size: 12px; color: var(--muted); display: block; }
+.stat b { font-family: var(--mono); font-size: 30px; font-weight: 600; line-height: 1.2; }
+.stat.err b { color: var(--s-err); }
+.stat small { color: var(--muted); font-size: 12px; margin-left: 2px; }
+
+/* sidebar-like tools */
+.tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tools button { font: inherit; font-size: 13px; padding: 7px 14px; border-radius: 4px; border: 1px solid var(--line); background: var(--surface-2); color: var(--fg); cursor: pointer; }
+.tools button:hover { border-color: var(--accent); }
+.tools button.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.tools button:disabled { opacity: .5; cursor: default; }
+.tools .meta { margin-left: auto; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (max-width: 900px) {
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .status { grid-template-columns: 1fr; }
+}
+@media (max-width: 560px) {
+  .badge { font-size: 22px; }
+  .tl li { grid-template-columns: 56px 74px 1fr; }
+  .tl li .zonechip, .tl li .detail { grid-column: 3; }
+  .tl li .detail { grid-column: 1 / -1; }
+  .stats { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <div class="top">
+    <h1>ピックR1！ 作業ダッシュボード</h1>
+    <span class="sub">モックアップ（表示はすべてサンプルデータ）</span>
+    <span class="live"><i></i>receiver 接続中 · 最終受信 <span id="lastRecv">--:--:--</span></span>
+  </div>
+
+  <div class="alert" id="alert" hidden role="alert">
+    <span class="msg" id="alertMsg"></span>
+    <button id="alertClose" type="button">確認した</button>
+  </div>
+
+  <section class="status" id="status" data-state="idle" aria-live="polite">
+    <div class="badge" id="badge">待機</div>
+    <div class="now">
+      <div class="kv"><span>箱ID</span><b id="nowBox">—</b></div>
+      <div class="kv"><span>分類先</span><b class="zone" id="nowZone">—</b></div>
+      <div class="kv"><span>この箱の経過</span><b id="nowElapsed">—</b></div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <div class="col">
+      <section class="panel">
+        <h2>作業タイムライン <small id="count"></small></h2>
+        <ul class="tl" id="tl"></ul>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="panel">
+        <h2>現在地（ステータス連動・位置は推定表示）</h2>
+        <svg class="map" viewBox="0 0 420 270" role="img" aria-label="スタート地点と区画A・Bの簡易マップ">
+          <path class="path" d="M70 135 L330 62"/>
+          <path class="path" d="M70 135 L330 208"/>
+          <rect class="zone" id="zoneA" x="290" y="26" width="110" height="72" rx="6"/>
+          <rect class="zone" id="zoneB" x="290" y="172" width="110" height="72" rx="6"/>
+          <text x="345" y="66" text-anchor="middle" font-weight="700">区画 A</text>
+          <text x="345" y="84" text-anchor="middle" class="lbl">右棚</text>
+          <text x="345" y="212" text-anchor="middle" font-weight="700">区画 B</text>
+          <text x="345" y="230" text-anchor="middle" class="lbl">左棚</text>
+          <circle class="start" cx="70" cy="135" r="26"/>
+          <text x="70" y="139" text-anchor="middle" class="lbl">START</text>
+          <text x="70" y="182" text-anchor="middle" class="lbl">QR読取位置</text>
+          <g id="robot" style="transform: translate(70px,135px)">
+            <circle class="body" r="13"/>
+            <circle class="eye" cx="-4" cy="-2" r="2.2"/><circle class="eye" cx="4" cy="-2" r="2.2"/>
+          </g>
+        </svg>
+      </section>
+
+      <section class="panel">
+        <h2>集計</h2>
+        <div class="stats">
+          <div class="stat"><span>区画A 処理数</span><b id="sA">0</b><small>個</small></div>
+          <div class="stat"><span>区画B 処理数</span><b id="sB">0</b><small>個</small></div>
+          <div class="stat err"><span>誤出荷検知</span><b id="sE">0</b><small>件</small></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>デモ操作（開発・保険デモ用）</h2>
+        <div class="tools">
+          <button class="primary" id="btnA" type="button">箱を流す → 区画A</button>
+          <button class="primary" id="btnB" type="button">箱を流す → 区画B</button>
+          <button id="btnE" type="button">誤出荷（想定外QR）</button>
+          <button id="btnR" type="button">ログをリセット</button>
+        </div>
+        <p class="note">実画面ではサイドバーに配置。ボタンは receiver へ POST /events を送るのと同じ動きを画面内で再現しています。</p>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var POS = { start: [70, 135], A: [330, 62], B: [330, 208] };
+  var LABEL = { scanned: '読取', moving: '移動', arrived: '到着', error: 'エラー' };
+  var IDLE_MS = 15000;
+  var events = [], boxN = 4, busy = false, idleTimer = null, firstAt = {};
+
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function hms(d) { return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()); }
+  function $(id) { return document.getElementById(id); }
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // サンプルの履歴（実画面では events.jsonl から読む）
+  var base = new Date(Date.now() - 6 * 60000);
+  function seed(offsetSec, ev, id, zone, detail) {
+    events.push({ ts: new Date(base.getTime() + offsetSec * 1000), event: ev, box: id, zone: zone, detail: detail });
+  }
+  seed(0, 'scanned', 'B001', 'A', 'QR読取成功 (0.8s)');
+  seed(2, 'moving', 'B001', 'A', '区画Aへ移動');
+  seed(14, 'arrived', 'B001', 'A', '腕で指し示し完了');
+  seed(60, 'scanned', 'B002', 'B', 'QR読取成功 (1.1s)');
+  seed(62, 'moving', 'B002', 'B', '区画Bへ移動');
+  seed(76, 'arrived', 'B002', 'B', '腕で指し示し完了');
+  seed(130, 'scanned', 'B003', 'A', 'リトライ1回で成功');
+  seed(132, 'moving', 'B003', 'A', '区画Aへ移動');
+  seed(145, 'arrived', 'B003', 'A', '腕で指し示し完了');
+  seed(200, 'error', 'X999', '?', '想定外QR: 区画定義なし');
+
+  function render(animateNew) {
+    var tl = $('tl'); tl.innerHTML = '';
+    events.slice().reverse().forEach(function (e, i) {
+      var li = document.createElement('li');
+      if (animateNew && i === 0) li.className = 'new';
+      li.innerHTML = '<span class="t">' + hms(e.ts) + '</span>' +
+        '<span><span class="pill ' + e.event + '">' + LABEL[e.event] + '</span></span>' +
+        '<span class="id">' + e.box + '</span>' +
+        '<span class="zonechip">' + (e.zone === '?' ? '—' : e.zone) + '</span>' +
+        '<span class="detail"></span>';
+      li.lastChild.textContent = e.detail;
+      tl.appendChild(li);
+    });
+    $('count').textContent = events.length + ' 件';
+    var a = 0, b = 0, er = 0;
+    events.forEach(function (e) {
+      if (e.event === 'arrived') { if (e.zone === 'A') a++; else if (e.zone === 'B') b++; }
+      if (e.event === 'error') er++;
+    });
+    $('sA').textContent = a; $('sB').textContent = b; $('sE').textContent = er;
+    if (events.length) $('lastRecv').textContent = hms(events[events.length - 1].ts);
+  }
+
+  function setState(state, text, box, zone) {
+    $('status').setAttribute('data-state', state);
+    $('badge').textContent = text;
+    $('nowBox').textContent = box || '—';
+    $('nowZone').textContent = zone ? (zone === '?' ? '不明' : '区画 ' + zone) : '—';
+    if (!box) $('nowElapsed').textContent = '—';
+  }
+  function moveRobot(p) { $('robot').style.transform = 'translate(' + p[0] + 'px,' + p[1] + 'px)'; }
+  function hot(zone) {
+    $('zoneA').classList.toggle('hot', zone === 'A');
+    $('zoneB').classList.toggle('hot', zone === 'B');
+  }
+  function resetIdleTimer() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () {
+      if (busy) return;
+      setState('idle', '待機'); hot(null); moveRobot(POS.start);
+    }, IDLE_MS);
+  }
+  function push(ev, box, zone, detail) {
+    events.push({ ts: new Date(), event: ev, box: box, zone: zone, detail: detail });
+    if (!firstAt[box]) firstAt[box] = Date.now();
+    render(true);
+  }
+  var tick = setInterval(function () {
+    var id = $('nowBox').textContent;
+    if (id && firstAt[id] && $('status').getAttribute('data-state') !== 'idle') {
+      $('nowElapsed').textContent = ((Date.now() - firstAt[id]) / 1000).toFixed(0) + ' 秒';
+    }
+  }, 500);
+
+  async function run(zone) {
+    if (busy) return; busy = true; setButtons();
+    var id = 'B' + String(++boxN).padStart(3, '0');
+    hot(null); moveRobot(POS.start);
+    setState('scan', '読取中', id, zone);
+    await wait(1200);
+    push('scanned', id, zone, 'QR読取成功 (0.9s)');
+    setState('move', '移動中', id, zone);
+    await wait(500);
+    push('moving', id, zone, '区画' + zone + 'へ移動');
+    moveRobot(POS[zone]);
+    await wait(1900);
+    push('arrived', id, zone, '腕で指し示し完了');
+    hot(zone); setState('done', '完了', id, zone);
+    busy = false; setButtons(); resetIdleTimer();
+  }
+  async function runError() {
+    if (busy) return; busy = true; setButtons();
+    setState('scan', '読取中', 'X999', '?');
+    await wait(1000);
+    firstAt['X999'] = Date.now();
+    push('error', 'X999', '?', '想定外QR: 区画定義なし');
+    setState('err', 'エラー', 'X999', '?');
+    $('alertMsg').textContent = '誤出荷の可能性: 想定外のQR（X999）を検知しました。この箱は仕分けせずに保留します。';
+    $('alert').hidden = false;
+    busy = false; setButtons(); resetIdleTimer();
+  }
+  function setButtons() {
+    ['btnA', 'btnB', 'btnE'].forEach(function (id) { $(id).disabled = busy; });
+  }
+
+  $('btnA').onclick = function () { run('A'); };
+  $('btnB').onclick = function () { run('B'); };
+  $('btnE').onclick = runError;
+  $('alertClose').onclick = function () { $('alert').hidden = true; };
+  $('btnR').onclick = function () {
+    events = []; boxN = 0; firstAt = {};
+    $('alert').hidden = true; setState('idle', '待機'); hot(null); moveRobot(POS.start);
+    $('lastRecv').textContent = '--:--:--'; render(false);
+  };
+
+  render(false);
+  hot('A'); setState('done', '完了', 'B003', 'A'); moveRobot(POS.A);
+  $('nowElapsed').textContent = '15 秒';
+  $('alertMsg').textContent = '誤出荷の可能性: 想定外のQR（X999）を検知しました。この箱は仕分けせずに保留します。';
+  $('alert').hidden = false;
+  setState('err', 'エラー', 'X999', '?'); hot(null); moveRobot(POS.start);
+  $('nowElapsed').textContent = '1 秒';
+})();
+</script>
+</body>
+</html>
