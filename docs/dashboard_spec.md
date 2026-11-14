@@ -1,6 +1,6 @@
 # ダッシュボード仕様（C 担当）
 
-`docs/task_schedule.md` の C 担当タスクの仕様。イベント JSON のフォーマットは task_schedule.md の「共通仕様」を正とする。
+`docs/task_schedule.md` の C 担当タスクの仕様。イベント JSON のフォーマットは [log_schema.md](log_schema.md) を正とする。
 
 ## 方針
 主役は「ロボット状態＋作業タイムライン」。集計・マップは補助。
