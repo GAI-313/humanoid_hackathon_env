@@ -22,7 +22,7 @@ from pathlib import Path
 
 from commands import make_go_to, make_target, post_command
 from events import make_event, post_event
-from qr_reader import StableDecoder, decode_qr, locate, parse_payload, parse_zone_marker
+from qr_reader import QRScanner, StableDecoder, locate, parse_payload, parse_zone_marker
 
 LOST_AFTER_SEC = 1.0  # 区画マーカーを見失ったと扱うまでの秒数
 
@@ -84,6 +84,7 @@ class Recognizer:
         self.target_interval = 1.0 / target_hz if target_hz and target_hz > 0 else 0.0
         self.run_id = run_id or datetime.now().strftime("%Y%m%d-%H%M")
         self._decoder = StableDecoder(confirm_frames, cooldown_sec)
+        self._scanner = QRScanner()  # 認識スレッド専用(フレームをまたいで追跡状態を持つ)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -197,7 +198,7 @@ class Recognizer:
     def _process(self, frame, now):
         dets, box_texts, seen = [], [], {}
         box_points = {}
-        for text, pts in decode_qr(frame):
+        for text, pts in self._scanner.scan(frame):
             zone = parse_zone_marker(text)
             if zone is not None:
                 loc = locate(pts, frame.shape, self.marker_size_m, self.hfov_deg)
