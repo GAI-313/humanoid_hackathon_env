@@ -11,7 +11,7 @@ B/A ──POST /events──▶ receiver (FastAPI, :8000) ──append──▶ 
                                                              ▲ read
                                             dashboard (Streamlit, :8501)
 ```
-- Streamlit は HTTP 受信口を持たないため、受信専用の `scripts/dashboard/receiver.py`（FastAPI、`POST /events` と `GET /health` のみ）を分離する
+- Streamlit は HTTP 受信口を持たないため、受信専用の `dashboard/receiver.py`（FastAPI、`POST /events` と `GET /health` のみ）を分離する
 - 永続化は JSONL（1行1イベント、追記のみ）。Streamlit は `st.fragment(run_every=1)` で末尾を読み込み再描画
 - 集計は読み込み時に pandas で都度計算（DB不要）。SQLite は使わない（JSONL で十分・工数削減）
 - 起動：`pixi run dashboard`（receiver と streamlit を同時起動するタスクを `pixi.toml` に登録）
@@ -50,3 +50,8 @@ B/A ──POST /events──▶ receiver (FastAPI, :8000) ──append──▶ 
 
 ## モックアップ
 [dashboard_mockup.html](dashboard_mockup.html)（ブラウザで開くと動作確認できる。表示はすべてサンプル）
+
+## 実装
+- 場所: `dashboard/`（`receiver.py` 受信 / `app.py` 画面 / `common.py` ログ読み書き・状態導出 / `send_dummy.py` ダミー送信 / `run.py` 同時起動）
+- 使い方は [dashboard_manual.md](dashboard_manual.md) を参照
+- 状態の「待機に戻す」は完了・エラーのみ対象（読取中・移動中は長引くため戻さない）

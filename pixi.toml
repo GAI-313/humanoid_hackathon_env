@@ -9,11 +9,19 @@ version = "0.1.0"
 verify-sdk = "python -c \"import cyclonedds, numpy, cv2, unitree_sdk2py; from unitree_sdk2py.core.channel import ChannelFactoryInitialize; print('unitree_sdk2py & cyclonedds loaded successfully!')\""
 sample-tts = "python samples/sample_tts.py"
 sample-walk = "python samples/sample_walk.py"
+dashboard = "python dashboard/run.py"
+receiver = "python -m uvicorn receiver:app --app-dir dashboard --host 0.0.0.0 --port 8000"
+dashboard-ui = "python -m streamlit run dashboard/app.py --server.port 8501 --server.headless true"
+send-dummy = "python dashboard/send_dummy.py"
 
 [dependencies]
 python = "3.10.*"
 numpy = ">=1.26"
 opencv = ">=4.8"
+fastapi = ">=0.141.1,<0.142"
+uvicorn = ">=0.52.4,<0.53"
+streamlit = ">=1.62.0,<2"
+pandas = ">=2.3.3,<3"
 
 [pypi-dependencies]
 cyclonedds = "==0.10.2"
