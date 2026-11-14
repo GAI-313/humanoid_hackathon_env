@@ -13,6 +13,10 @@ dashboard = "python dashboard/run.py"
 receiver = "python -m uvicorn receiver:app --app-dir dashboard --host 0.0.0.0 --port 8000"
 dashboard-ui = "python -m streamlit run dashboard/app.py --server.port 8501 --server.headless true"
 send-dummy = "python dashboard/send_dummy.py"
+recognize = "python scripts/recognize.py"
+camera-check = "python scripts/camera_check.py"
+make-qr = "python scripts/make_qr.py"
+test-recognition = "python scripts/test_recognition.py"
 
 [dependencies]
 python = "3.10.*"
