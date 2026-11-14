@@ -297,14 +297,27 @@ def parse_zone_marker(text):
     return m.group(1).upper() if m else None
 
 
+# 現場の箱に貼ってある QR の中身(ITEM-xxx)から、箱IDと区画を引く固定の表。キーは大文字・前後空白なし。
+# ITEM と ITME は同じ QR の綴り違い(仕様メモの表記ゆれ)で、どちらで貼ってあっても同じ扱いにする。
+FIXED_QR_TABLE = {
+    "ITEM-001": ("A001", "A"),
+    "ITEM-002": ("B001", "B"),
+    "ITEM-003": ("B001", "B"),
+}
+FIXED_QR_TABLE.update({k.replace("ITEM", "ITME"): v for k, v in list(FIXED_QR_TABLE.items())})
+
+
 def parse_payload(text):
-    """{"box_id":"B001","zone":"A"} または B001:A を解釈する。不可なら None。
+    """{"box_id":"B001","zone":"A"} / B001:A / 固定表(FIXED_QR_TABLE の ITEM-001 など)を解釈する。不可なら None。
     区画マーカー(ZONE:A など)は箱ではないので None。"""
     if not isinstance(text, str):
         return None
     if parse_zone_marker(text) is not None:
         return None
     s = text.strip()
+    fixed = FIXED_QR_TABLE.get(s.upper())
+    if fixed is not None:
+        return {"box_id": fixed[0], "zone": fixed[1]}
     if s.startswith("{"):
         try:
             obj = json.loads(s)
