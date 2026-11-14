@@ -53,10 +53,7 @@
 
 
 
-
-
-
-- [ ] `scripts/template.py` から `scripts/pick_move.py` を作成、LocoClient で前進・旋回・停止
+- [x] `scripts/template.py` から `scripts/pick_move.py` を作成、LocoClient で前進・旋回・停止
 - [ ] 目的地（区画A/B）への移動を関数化（`go_to(zone)`：Move 再送＋`StopMove()`）
 - [ ] 腕プリセット動作の確認（指し示し・手を振る＝完了表現）
 - [ ] 安全：歩行テストは周囲を空け、緊急停止手順を共有
@@ -65,10 +62,7 @@
 
 
 
-
-
-
-- [ ] R1 のカメラ画像を PC で取得する方法を確立（取得不可の場合は代替：外付けWebカメラ/スマホをR1頭部に固定）
+- [x] R1 のカメラ画像を PC で取得する方法を確立（取得不可の場合は代替：外付けWebカメラ/スマホをR1頭部に固定）
 - [ ] OpenCV の QRCodeDetector で静止画→動画の読取を確認（pyzbar は予備）
 - [ ] 読取結果の形式を決める（例：`{"box_id":"B001","zone":"A"}`）
 - [ ] Gemini API キーを用いた画像認識のプロトタイプ（Could。QR読取が安定してから）
@@ -77,11 +71,15 @@
 
 
 
+
+
 - [x] ダッシュボード仕様を確認する（[dashboard\_spec.md](dashboard_spec.md)）
 - [x] 技術選定：最速で作れるもの（Flask/FastAPI + 単一HTML、更新は SSE/ポーリング）
 - [x] ダミーイベントを流して画面が更新されるところまで作る
 
 **D PM・デモ**
+
+
 
 
 

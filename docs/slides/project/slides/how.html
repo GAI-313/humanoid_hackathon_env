@@ -1,0 +1,16 @@
+<section id="how" data-transition="fade">
+<h2>仕組み：読取・判定・移動・可視化</h2>
+<div class="flow">
+<div class="card"><h3>R1のカメラ</h3><p class="s">箱のQRを撮影して読み取る（OpenCV）</p></div>
+<x-shape class="arrow" kind="arrow-right" style="width:64px;height:40px;background:#F26A10"></x-shape>
+<div class="card"><h3>判定・イベント化</h3><p class="s">箱IDと区画を判定し、JSONで送信</p></div>
+<x-shape class="arrow" kind="arrow-right" style="width:64px;height:40px;background:#F26A10"></x-shape>
+<div class="stack">
+<div class="card"><h3>ロボット制御</h3><p class="s">分類先の区画まで歩いて移動</p></div>
+<div class="card"><h3>ダッシュボード</h3><p class="s">読取・移動・到着・エラーをリアルタイム表示</p></div>
+</div>
+</div>
+<p class="band dash">＋ Gemini画像認識：箱の見た目を照合して、誤出荷を二重チェック</p>
+<p class="foot">ピックR1！　チーム紹介</p>
+<aside>【約60秒】仕組みはシンプルです。R1のカメラでQRを読み、箱IDと区画を判定して、JSONのイベントとして送ります。イベントは2か所に届きます。ひとつはロボット制御で、分類先の区画へ歩かせます。もうひとつはダッシュボードで、読取・移動・到着・エラーをリアルタイムに表示します。さらに、Geminiの画像認識で箱の見た目も照合し、誤出荷を二重にチェックします。</aside>
+</section>
