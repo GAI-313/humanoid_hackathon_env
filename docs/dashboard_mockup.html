@@ -28,22 +28,7 @@
   --s-err-bg: #f9dede;
   --font: "Noto Sans JP", "Hiragino Sans", "Yu Gothic UI", system-ui, sans-serif;
   --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #0f141c; --surface: #171e29; --surface-2: #1d2633; --line: #2a3546;
-    --fg: #e6ebf3; --muted: #93a1b5; --accent: #6f9bff;
-    --s-idle: #93a1b5; --s-scan: #6f9bff; --s-move: #e8b04a; --s-done: #4cc38a; --s-err: #ff7b7b;
-    --s-idle-bg: #232d3b; --s-scan-bg: #1c2d52; --s-move-bg: #3a2e14; --s-done-bg: #15382a; --s-err-bg: #4a1f24;
-    color-scheme: dark;
-  }
-}
-:root[data-theme="dark"] {
-  --bg: #0f141c; --surface: #171e29; --surface-2: #1d2633; --line: #2a3546;
-  --fg: #e6ebf3; --muted: #93a1b5; --accent: #6f9bff;
-  --s-idle: #93a1b5; --s-scan: #6f9bff; --s-move: #e8b04a; --s-done: #4cc38a; --s-err: #ff7b7b;
-  --s-idle-bg: #232d3b; --s-scan-bg: #1c2d52; --s-move-bg: #3a2e14; --s-done-bg: #15382a; --s-err-bg: #4a1f24;
-  color-scheme: dark;
+  color-scheme: light;
 }
 * { box-sizing: border-box; }
 body { background: var(--bg); color: var(--fg); font-family: var(--font); font-size: 15px; line-height: 1.5; }
