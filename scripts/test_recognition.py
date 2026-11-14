@@ -26,6 +26,8 @@ from camera_source import open_source  # noqa: E402
 from make_qr import encode_qr  # noqa: E402
 from qr_reader import StableDecoder, decode_qr, locate, parse_payload, parse_zone_marker  # noqa: E402
 from recognition_link import Recognizer  # noqa: E402
+import pick_move  # noqa: E402
+import qr_survey  # noqa: E402
 
 
 def scene(text, canvas=1200, qr_px=320, angle=8.0):
@@ -279,6 +281,150 @@ def test_post_command_failure():
     with contextlib.redirect_stderr(io.StringIO()):
         assert commands.post_command("http://127.0.0.1:9/command", {"a": 1}, timeout=0.3) is False
     assert commands.post_command(None, {}) is False
+
+
+def test_survey_summarize():
+    def det(text, size, off):
+        return {"text": text, "size": size, "offset": off}
+
+    recs = [
+        {"ms": 10.0, "dets": [det("ZONE:A", 0.10, 0.2), det("B001:A", 0.30, -0.1)]},
+        {"ms": 20.0, "dets": [det("ZONE:A", 0.20, 0.4)]},
+        {"ms": 30.0, "dets": []},
+        {"ms": 40.0, "dets": [det("ZONE:A", 0.30, 0.0), det("ZONE:A", 0.30, 0.0)]},  # 同一フレーム重複
+    ]
+    s = qr_survey.summarize(recs)
+    assert s["frames"] == 4 and s["hit_frames"] == 3 and abs(s["hit_rate"] - 0.75) < 1e-9
+    assert abs(s["decode_ms_mean"] - 25.0) < 1e-9 and s["decode_ms_max"] == 40.0
+    z = next(t for t in s["texts"] if t["text"] == "ZONE:A")
+    assert z["kind"] == "zone" and z["hits"] == 3 and abs(z["rate"] - 0.75) < 1e-9
+    assert abs(z["size_mean"] - 0.2) < 1e-9 and z["size_min"] == 0.10 and z["size_max"] == 0.30
+    assert abs(z["offset_mean"] - 0.2) < 1e-9
+    b = next(t for t in s["texts"] if t["text"] == "B001:A")
+    assert b["kind"] == "box" and b["hits"] == 1 and abs(b["rate"] - 0.25) < 1e-9
+    empty = qr_survey.summarize([{"ms": 5.0, "dets": []}])
+    assert empty["hit_frames"] == 0 and empty["texts"] == []
+    rows = qr_survey.csv_rows(empty, {"fps": 1.0, "width": 1, "height": 1}, "x", "file", "t")
+    assert len(rows) == 1 and rows[0]["text"] == ""
+
+
+def _tgt(offset, size):
+    return {"offset": offset, "size_ratio": size, "bearing": "x", "distance_m": None, "zone": "A"}
+
+
+def test_zone_approach():
+    A = pick_move.ZoneApproach
+    d = A().step(_tgt(-0.5, 0.1), 0.0)  # 左のマーカー -> 左旋回(vyaw 正)
+    assert d["state"] == "turn" and d["vyaw"] > 0 and d["vx"] == 0.0 and d["vy"] == 0.0, d
+    d = A().step(_tgt(0.5, 0.1), 0.0)
+    assert d["state"] == "turn" and d["vyaw"] < 0, d
+    d = A().step(_tgt(0.0, 0.1), 0.0)
+    assert d["state"] == "forward" and d["vx"] == 0.2 and abs(d["vyaw"]) < 1e-9, d
+    d = A().step(_tgt(0.075, 0.1), 0.0)
+    assert d["state"] == "forward" and d["vyaw"] < 0 and abs(d["vyaw"]) <= 0.15 + 1e-9, d
+    d = A().step(_tgt(0.5, 0.3), 0.0)  # 大きければ offset に関わらず到着
+    assert d["state"] == "arrived" and d["vx"] == 0.0 and d["vyaw"] == 0.0, d
+    # 見失い
+    a = A(lost_timeout=3.0)
+    a.step(_tgt(0.0, 0.1), 0.0)
+    assert a.step(None, 1.0)["state"] == "wait"
+    d = a.step(None, 3.5)
+    assert d["state"] == "failed" and d["vx"] == 0.0, d
+    a = A(lost_timeout=3.0, search=True)
+    a.step(_tgt(0.0, 0.1), 0.0)
+    assert a.step(None, 1.0)["state"] == "wait"
+    d = a.step(None, 3.5)
+    assert d["state"] == "search" and abs(d["vyaw"] - 0.15) < 1e-9 and d["vx"] == 0.0, d
+    # 最初から見えない場合は開始時刻が基準
+    a = A(lost_timeout=3.0)
+    assert a.step(None, 10.0)["state"] == "wait" and a.step(None, 14.0)["state"] == "failed"
+    # move_timeout は常に failed(見えていても)
+    a = A(move_timeout=30.0, search=True)
+    a.step(_tgt(0.0, 0.1), 0.0)
+    assert a.step(_tgt(0.0, 0.1), 31.0)["state"] == "failed"
+    # 速度上限の丸め
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        a = A(vx_max=1.0, vyaw_max=2.0)
+    assert a.vx_max == 0.3 and a.vyaw_max == 0.5 and "丸め" in err.getvalue()
+    assert abs(a.step(_tgt(1.0, 0.1), 0.0)["vyaw"]) <= 0.5
+    with contextlib.redirect_stderr(io.StringIO()):
+        a = A(vx_max=-1.0)
+    assert a.vx_max == 0.0
+
+
+class _FakeLoco:
+    def __init__(self, fail_move=False):
+        self.calls = []
+        self.fail_move = fail_move
+
+    def Move(self, vx, vy, vyaw):
+        if self.fail_move:
+            raise RuntimeError("Move失敗(テスト)")
+        self.calls.append(("Move", vx, vy, vyaw))
+        return 0
+
+    def StopMove(self):
+        self.calls.append(("StopMove",))
+        return 0
+
+    def WaveHand(self):
+        self.calls.append(("WaveHand",))
+        return 0
+
+
+def _pick_scene(marker_px, marker_x):
+    img = np.full((700, 1400, 3), 128, np.uint8)
+    for text, x, px, y in (('{"box_id":"B001","zone":"A"}', 100, 300, 200), ("ZONE:A", marker_x, marker_px, 100)):
+        qr = cv2.resize(encode_qr(text, 600), (px, px), interpolation=cv2.INTER_AREA)
+        img[y:y + px, x:x + px] = qr
+    return img
+
+
+def _pick_args(path, *extra):
+    return pick_move.build_parser().parse_args(
+        ["--source", "file", "--path", str(path), *extra])
+
+
+def test_pick_move_dry_run_and_arrived():
+    with tempfile.TemporaryDirectory() as td:
+        small, big = Path(td) / "small.png", Path(td) / "big.png"
+        cv2.imwrite(str(small), _pick_scene(180, 1000))   # 小さめ・右寄り
+        cv2.imwrite(str(big), _pick_scene(600, 700))      # 大きい
+        loco = _FakeLoco()
+        with contextlib.redirect_stdout(io.StringIO()):
+            evs = pick_move.run(_pick_args(small, "--max-seconds", "3.5"), loco=loco)
+        assert any(c[0] == "Move" for c in loco.calls), loco.calls
+        mv = next(c for c in loco.calls if c[0] == "Move")
+        assert mv[3] < 0, mv  # 右寄り -> 右旋回
+        assert loco.calls[-1] == ("StopMove",), loco.calls[-3:]
+        assert [e["event"] for e in evs] == ["moving"], evs
+        assert evs[0]["data"] == {"from": "start", "to": "A"} and evs[0]["source"] == "control"
+        loco = _FakeLoco()
+        with contextlib.redirect_stdout(io.StringIO()):
+            evs = pick_move.run(_pick_args(big, "--max-seconds", "6", "--once", "--gesture", "wave"),
+                                loco=loco)
+        assert [e["event"] for e in evs] == ["moving", "arrived"], evs
+        assert evs[1]["data"]["gesture"] == "wave" and "duration_ms" in evs[1]["data"]
+        assert ("WaveHand",) in loco.calls and loco.calls[-1] == ("StopMove",)
+        # 既定(loco 未指定)は dry-run: 実機の SDK を触らず終了できる
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pick_move.run(_pick_args(big, "--once", "--max-seconds", "6"))
+        assert "[dry-run] StopMove()" in out.getvalue()
+
+
+def test_pick_move_stopmove_on_exception():
+    with tempfile.TemporaryDirectory() as td:
+        small = Path(td) / "small.png"
+        cv2.imwrite(str(small), _pick_scene(180, 1000))
+        loco = _FakeLoco(fail_move=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                pick_move.run(_pick_args(small, "--max-seconds", "4"), loco=loco)
+                raise AssertionError("例外が伝わるはず")
+            except RuntimeError as e:
+                assert "Move失敗" in str(e)
+        assert loco.calls and loco.calls[-1] == ("StopMove",), loco.calls
 
 
 def main() -> int:

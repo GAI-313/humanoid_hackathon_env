@@ -18,6 +18,8 @@ camera-check = "python scripts/camera_check.py"
 make-qr = "python scripts/make_qr.py"
 test-recognition = "python scripts/test_recognition.py"
 control-example = "python scripts/control_example.py"
+qr-survey = "python scripts/qr_survey.py"
+pick-move = "python scripts/pick_move.py"
 
 [dependencies]
 python = "3.10.*"

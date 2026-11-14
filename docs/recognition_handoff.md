@@ -2,20 +2,21 @@
 
 最終更新: 2026-11-14（Day1 午後）
 
-箱のQRの読取、区画マーカーの認識、ダッシュボードへの送信、制御（担当A）への指示の受け渡しまで、PC内蔵カメラと合成画像で動いています。R1 の頭部カメラから映像を取る部分と、A のスクリプトとの結合が未確認です。次に実機を使える人は「次にやること」の1から進めてください。
+箱のQRの読取、区画マーカーの認識、ダッシュボードへの送信、制御（担当A）への指示の受け渡しまで、PC内蔵カメラと合成画像で動いています。R1 の頭部カメラからの取得（`videohub`）は、実機で画像を保存できるところまで確認できました。残りは、実機のカメラでの読取成功率の計測と、移動を伴う通し確認です。次に実機を使える人は「次にやること」の1から進めてください。
 
 ## いま動くもの・未確認のもの
 
 | 項目 | 状態 | 確認方法 |
 |---|---|---|
-| QRの読取と分類先の判定 | 動作確認済み | `scripts/test_recognition.py` が 12/12 成功 |
+| QRの読取と分類先の判定 | 動作確認済み | `scripts/test_recognition.py` が 16/16 成功 |
 | receiver への送信（`scanned` / `error`） | 動作確認済み | ローカルの receiver が 201 を返し、`logs/events.jsonl` に保存された |
 | 区画マーカー（`ZONE:A`）の認識と位置の算出 | 動作確認済み | 合成画像で左右のずれと大きさが期待どおり |
 | 制御（担当A）への指示（`go_to` / `target`） | 動作確認済み（受け側は見本） | `control_example.py --listen` が受信した |
 | 担当A の実コードとの結合 | **未着手** | A のスクリプトが main にまだ無い |
 | PC内蔵カメラからの取得（`webcam`） | 動作確認済み | 640x480、約15fps |
-| R1 頭部カメラからの取得（`videohub`） | **実機で未確認** | 下の「次にやること」1 |
-| R1 の UDP 配信の受信（`udp`） | **実機で未確認** | `videohub` で取れない場合の予備 |
+| R1 頭部カメラからの取得（`videohub`） | 実機で確認済み | `camera-check --source videohub` で画像を保存できた（解像度と fps の記録は未取得） |
+| 認識と移動の結合（`pick_move.py`） | dry-run で動作確認済み、**実機は未確認** | 下の「次にやること」2 |
+| R1 の UDP 配信の受信（`udp`） | 未確認（予備） | `videohub` で取れたので当面は不要 |
 | pixi 環境での実行 | **未確認** | 確認はシステムの Python 3.12 / OpenCV 5.0 で行った |
 
 ## 構成
@@ -36,11 +37,14 @@ R1 頭部カメラ ─(有線LAN・DDS)─▶ camera_source.py ─▶ qr_reader.
 | `scripts/commands.py` | A への指示（`go_to` / `target`）の生成と POST |
 | `scripts/control_example.py` | A 向けの見本。ロボットは動かさず、判断結果を表示するだけ |
 | `scripts/recognize.py` | `Recognizer` を使う CLI |
+| `scripts/qr_survey.py` | 読取成功率の計測。結果を `work/qr_survey.csv` に追記する |
+| `scripts/pick_move.py` | 認識と移動の結合。箱の QR が確定したら区画マーカーへ向かう。既定はロボットを動かさない |
+| `scripts/r1_clients.py` | R1 用の `R1LocoClient`（スキル同梱のものをコピー） |
 | `scripts/camera_check.py` | 取得元の診断。解像度・fps・成功率を表示し、1枚を `work/camera_check.jpg` に保存する |
 | `scripts/make_qr.py` | テスト用QRの生成（`work/qr/` に出力） |
 | `scripts/test_recognition.py` | 実機なしの自己テスト |
 
-`pixi.toml` の `[tasks]` に `recognize` / `camera-check` / `make-qr` / `test-recognition` / `control-example` を追加しました。依存パッケージは変えていません。
+`pixi.toml` の `[tasks]` に `recognize` / `camera-check` / `make-qr` / `test-recognition` / `control-example` / `qr-survey` / `pick-move` を追加しました。依存パッケージは変えていません。
 
 ## R1 のカメラ映像の取り方
 
@@ -134,18 +138,33 @@ pixi run recognize --source webcam --show --command-url http://localhost:8001/co
 
 ## 次にやること
 
-1. **実機で `camera-check --source videohub` を実行する**。`work/camera_check.jpg` に画像が保存されれば、取得経路はこれで確定です。
-2. **1 が失敗した場合**、表示されるエラーコードで切り分けます。`3104`（応答なし）なら、R1 のアプリの「Settings → Service Status」で `video_hub` が動いているかをスタッフに確認します。それでも取れなければ `--source udp --port 5001` を試します。公式マニュアルでは、`video_hub` を止めて `Stereo Patch PC1` を起動すると、ポート 5001 に 1280x720 の映像が RTP/H264 で配信されます。Windows ではファイアウォールで UDP 5001 の受信を許可する必要があるかもしれません。
-3. **どちらも取れない場合**は、外付けの Web カメラを頭部に固定し、`--source webcam --index 1` で進めます。
-4. **実機のカメラで QR の読取成功率を測る**（距離・角度・照明）。`--save-dir work/shots` を付けると、確定した瞬間のフレームが残ります。
-5. **制御（担当A）と結合する**。受け渡しの口は用意してあるので、A のスクリプトに `Recognizer` を組み込み、`control_example.py` の `decide()` に当たる部分を実際の `Move()` に置き換えます。区画マーカーを実機のカメラで読める距離と、到着とみなす `size_ratio` は実測で決めます。
-6. **Gemini による商品認識（Could）**は未着手です。QR の読取が実機で安定してから、停止位置の静止画を1枚だけ送る形で足す想定です。
+1. **実機のカメラで読取成功率を測る**。箱の QR と区画マーカーを、距離と角度を変えて計測します。`--label` に条件を書くと、`work/qr_survey.csv` に1行ずつ残ります。読める最大距離と、そのときの `size_ratio` を押さえるのが目的です。
+
+   ```bash
+   pixi run qr-survey --source videohub -i <iface> --seconds 10 --label "1.0m 正面"
+   ```
+
+2. **移動を伴う通し確認をする**。必ず次の順で進めます。
+   1. dry-run で、表示される速度の向きが正しいかを見る（マーカーを左に置くと `vyaw` が正、右で負、正面で前進）。
+      ```bash
+      pixi run pick-move --source videohub -i <iface> --zone A
+      ```
+   2. R1 を**スタンドに吊った状態**で `--execute` を付ける。停止担当がコントローラーを持つ2名体制で行う。
+      ```bash
+      pixi run pick-move --source videohub -i <iface> --zone A --execute
+      ```
+   3. 接地して、周囲を2m以上空けて同じコマンドを実行する。問題なければ `--zone` を外し、箱の QR から通す。
+3. **到着の閾値を実測で決める**。既定の `--arrive-size 0.25` は仮の値です。1 の計測で、止まりたい距離での `size_ratio` を調べて置き換えます。QR の白い余白は大きさに含まれないので、見た目より少し小さく出ます。
+4. **制御（担当A）と役割を合わせる**。`pick_move.py` は A の `go_to(zone)` に当たる部分を先に形にしたものです。A のスクリプトができたら、どちらを本番にするかを決めます。腕で指し示す動作は入っていません（到着後の `--gesture wave` のみ）。
+5. **Gemini による照合（Could）**は未着手です。QR の流れが実機で通ってから、停止位置の静止画を1枚だけ送る形で足す想定です。
 
 ## 既知の注意点
 
 - 同じ QR を映し続けると、5秒ごとに `scanned` を再送します。1箱1回にしたい場合は、`qr_reader.py` の `StableDecoder` を「一度見えなくなるまで再送しない」動きに変えてください。
 - `run_id` は起動時刻（`YYYYMMDD-HHMM`）を自動で付けます。リハーサルごとに `recognize` を起動し直すと、通し実行ごとに分かれます。
 - receiver への送信に失敗しても認識は止まらず、警告を1行出します。422 が返る場合は、警告に出る本文で不足している項目が分かります。
+- `pick_move.py` は `--execute` を付けない限りロボットに何も送りません。送るのは `Move` / `StopMove` と、`--gesture wave` のときの `WaveHand` だけです。速度は前進 0.3 m/s、旋回 0.5 rad/s を上限にコード側で丸めます（既定は 0.2 と 0.3）。マーカーを3秒見失うと止まって終了し、どの終わり方でも最後に `StopMove` を送ります。
+- `pick_move.py` の `--execute` は SDK の無い環境で作ったため、実機でもモックでも未実行です。先に `-d 1` でモック（`mock_robot.py`）に向けて確かめられます。
 - `videohub` は1枚ごとに要求と応答を往復するので、fps は高くありません。QR の読取には足りる見込みですが、実測はまだです。
 - OpenCV 4.8 系（pixi 環境）では未実行です。版による API の違いはコード側で吸収していますが、最初に `pixi run test-recognition` を通してください。
 
@@ -156,6 +175,8 @@ pixi run recognize --source webcam --show --command-url http://localhost:8001/co
 - 取得元を差し替えられる構成で、取得・読取・送信のスクリプトを作成した。
 - `docs/log_schema.md` と `dashboard/receiver.py` に合わせて、イベントに `v` / `run_id` / `source` を付け、`ts` をタイムゾーン付きにした。`task_schedule.md` の「イベント JSON」の6項目だけでは、receiver が 422 を返す。
 - 合成した QR 画像で、正常系と想定外 QR の両方が receiver に保存されることを確認した。
+- 別の PC で `camera-check --source videohub` を実行し、R1 の頭部カメラの画像を保存できた。
+- 読取成功率の計測（`qr_survey.py`）と、認識と移動の結合（`pick_move.py`）を追加した。
 - 区画マーカーの認識と、制御（担当A）への指示の受け渡し（`Recognizer` と `--command-url`）を追加した。合成画像で、箱の確定から `go_to`、`target` の受信までを確認した。
 
 ## 参照

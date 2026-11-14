@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""認識と移動の結合: 箱のQRが確定したら、その zone の区画マーカー(QR `ZONE:A`)を
+カメラで追いながら近づき、十分大きく見えたら停止する。
+
+既定は dry-run(ロボットに一切コマンドを送らず、送るはずだった Move 等を print するだけ)。
+実機へ送るのは --execute を付けたときだけ。
+
+例:
+  python scripts/pick_move.py --source webcam                      # dry-run
+  python scripts/pick_move.py --source file --path work/x.png --max-seconds 4
+  python scripts/pick_move.py --source videohub -i eth0 --zone A   # dry-run, 箱を待たず区画Aへ
+  python scripts/pick_move.py --source videohub -i eth0 --execute --once --gesture wave
+  python scripts/pick_move.py --source videohub -d 1 --execute     # モック(DDS ドメイン1)へ
+
+実機で動かす前に: 2名体制(実行者+コントローラーを持った停止担当)、周囲2m以上を空ける、
+初回はロボットを吊った状態で試す、緊急停止は L2+B の長押し。
+使うロボット操作は Move / StopMove / WaveHand だけ(モード切替や起き上がりは呼ばない)。
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from camera_source import CameraError, add_source_args, source_from_args  # noqa: E402
+from events import make_event, post_event  # noqa: E402
+from recognition_link import add_recognizer_args, recognizer_from_args  # noqa: E402
+
+VX_LIMIT = 0.3        # 前進速度の上限(m/s)。コード側で必ず丸める
+VYAW_LIMIT = 0.5      # 旋回速度の上限(rad/s)
+PERIOD = 0.2          # 制御周期(5Hz)。Move は約1秒で失効するので毎周期再送する
+PRINT_INTERVAL = 1.0  # 同じ内容が続くときの表示間隔(秒)
+
+
+class PickMoveError(RuntimeError):
+    """実行できない状況(SDK 未導入・引数不正など)。日本語の原因を添える。"""
+
+
+class ZoneApproach:
+    """区画マーカーへ近づく判断(純粋なクラス。ロボットにもカメラにも触らない)。
+
+    step(target, now) -> {"state", "vx", "vy", "vyaw", "reason"}
+      target: Recognizer.get_target(zone) の戻り値(見えなければ None)
+      now: 単調増加の秒(time.monotonic など)。最初の step 呼び出しを開始時刻とする。
+    state: turn(その場旋回) / forward(前進) / search(探索旋回) / wait(静止して待つ)
+           / arrived(到着) / failed(失敗)
+    vyaw は正が反時計回り(左旋回)。マーカーが右(offset>0)なら右旋回=負になる。
+    """
+
+    def __init__(self, vx_max=0.2, vyaw_max=0.3, turn_offset=0.15, arrive_size=0.25,
+                 lost_timeout=3.0, move_timeout=30.0, search=False):
+        self.vx_max = self._clamp("vx", vx_max, VX_LIMIT)
+        self.vyaw_max = self._clamp("vyaw", vyaw_max, VYAW_LIMIT)
+        self.turn_offset = max(float(turn_offset), 1e-6)
+        self.arrive_size = float(arrive_size)
+        self.lost_timeout = float(lost_timeout)
+        self.move_timeout = float(move_timeout)
+        self.search = bool(search)
+        self._t0 = None
+        self._last_seen = None
+
+    @staticmethod
+    def _clamp(name, value, limit):
+        value = float(value)
+        clamped = max(0.0, min(value, limit))
+        if clamped != value:
+            print(f"[警告] --{name} {value} は安全上の上限(0〜{limit})の範囲外のため "
+                  f"{clamped} に丸めました。", file=sys.stderr)
+        return clamped
+
+    def fresh(self):
+        """同じ設定で、開始時刻・最後に見えた時刻だけ初期化した新しいインスタンス(箱ごとに使う)。"""
+        return ZoneApproach(self.vx_max, self.vyaw_max, self.turn_offset, self.arrive_size,
+                            self.lost_timeout, self.move_timeout, self.search)
+
+    @staticmethod
+    def _out(state, vx, vyaw, reason):
+        return {"state": state, "vx": float(vx), "vy": 0.0, "vyaw": float(vyaw), "reason": reason}
+
+    def step(self, target, now):
+        if self._t0 is None:
+            self._t0 = now
+        if now - self._t0 > self.move_timeout:
+            return self._out("failed", 0.0, 0.0, f"移動開始から {self.move_timeout:g} 秒を超えた")
+        if target is None:
+            ref = self._last_seen if self._last_seen is not None else self._t0
+            lost = now - ref
+            if lost < self.lost_timeout:
+                return self._out("wait", 0.0, 0.0, f"マーカーが見えない({lost:.1f}秒)")
+            if self.search:
+                return self._out("search", 0.0, self.vyaw_max * 0.5, "マーカーを探して旋回")
+            return self._out("failed", 0.0, 0.0,
+                             f"区画マーカーを {self.lost_timeout:g} 秒以上見失った")
+        self._last_seen = now
+        offset, size = float(target["offset"]), float(target["size_ratio"])
+        if size >= self.arrive_size:
+            return self._out("arrived", 0.0, 0.0, f"size_ratio {size:.2f} >= {self.arrive_size:g}")
+        if abs(offset) > self.turn_offset:
+            sign = 1.0 if offset > 0 else -1.0
+            return self._out("turn", 0.0, -sign * self.vyaw_max, f"offset {offset:+.2f} が大きい")
+        vyaw = -offset / self.turn_offset * self.vyaw_max * 0.5
+        return self._out("forward", self.vx_max, vyaw, "前進")
+
+
+class DryRunLoco:
+    """ロボットへは何も送らず、送るはずだったコマンドを print するだけ。"""
+
+    def __init__(self, interval=PRINT_INTERVAL, clock=time.monotonic):
+        self._interval = interval
+        self._clock = clock
+        self._last = None
+        self._last_t = -1e9
+
+    def Move(self, vx, vy, vyaw):
+        key = (round(vx, 3), round(vy, 3), round(vyaw, 3))
+        now = self._clock()
+        if key != self._last or now - self._last_t >= self._interval:  # 同じ内容は間引く
+            print(f"[dry-run] Move(vx={vx:.3f}, vy={vy:.3f}, vyaw={vyaw:.3f})", flush=True)
+            self._last, self._last_t = key, now
+        return 0
+
+    def StopMove(self):
+        print("[dry-run] StopMove()", flush=True)
+        return 0
+
+    def WaveHand(self):
+        print("[dry-run] WaveHand()", flush=True)
+        return 0
+
+
+def make_real_loco(domain, interface, init_dds):
+    """実機(またはモック)用の R1LocoClient を作る。SDK は必要になったここで初めて import する。
+    init_dds=True のときだけ DDS を初期化する(videohub 取得元は source_from_args が済ませている)。"""
+    try:
+        from r1_clients import R1LocoClient
+        if init_dds:
+            from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+    except ImportError as e:
+        raise PickMoveError(
+            f"--execute には unitree_sdk2py が必要ですが import できません({e})。"
+            "pixi 環境(pixi run pick-move ...)で実行してください。") from e
+    if init_dds:
+        Path("/tmp").mkdir(exist_ok=True)  # CycloneDDS のログ出力先
+        ChannelFactoryInitialize(domain, interface)
+    loco = R1LocoClient()
+    loco.SetTimeout(10.0)
+    loco.Init()
+    time.sleep(1.0)  # DDS ディスカバリ待ち。省くと最初の呼び出しが失敗する
+    return loco
+
+
+SAFETY_NOTICE = """\
+================ 実機に移動コマンドを送ります(--execute) ================
+ - 2名体制: 実行者とは別に、コントローラーを持った停止担当を置く
+ - 周囲 2m 以上を空ける。初めて動かすときはロボットを吊った状態で試す
+ - 緊急停止: 底面の Emergency Stop、または L2 + B を長押し
+ - 送るのは Move / StopMove(と --gesture wave 時の WaveHand)だけ。Ctrl+C でも停止します
+ 3秒後に開始します。やめるなら今すぐ Ctrl+C。
+========================================================================="""
+
+
+def _check(label, code):
+    """RPC の戻り値(0 以外はエラー)を警告に出す。None(戻り値なしの偽物)は無視。"""
+    if code not in (0, None):
+        print(f"[警告] {label} がエラーコード {code} を返しました。", file=sys.stderr, flush=True)
+
+
+class _StatusPrinter:
+    """毎周期の状態表示。state と速度が同じ間は1秒に1回に間引く。"""
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._key = None
+        self._t = -1e9
+
+    def show(self, zone, d, target):
+        key = (d["state"], round(d["vx"], 3), round(d["vyaw"], 3))
+        now = self._clock()
+        if key == self._key and now - self._t < PRINT_INTERVAL:
+            return
+        self._key, self._t = key, now
+        seen = (f"offset={target['offset']:+.2f} size_ratio={target['size_ratio']:.3f}"
+                if target else "offset=- size_ratio=-")
+        print(f"[区画 {zone}] {d['state']:<7} {seen} -> vx={d['vx']:.2f} vy={d['vy']:.2f} "
+              f"vyaw={d['vyaw']:+.2f} ({d['reason']})", flush=True)
+
+
+def _approach(rec, loco, zone, appr, deadline, clock, sleep):
+    """1つの区画へ近づく。(state, reason) を返す。state は arrived / failed / timeout。"""
+    printer = _StatusPrinter(clock)
+    next_t = clock()
+    while True:
+        now = clock()
+        if deadline is not None and now >= deadline:
+            return "timeout", "--max-seconds に達した"
+        tgt = rec.get_target(zone)
+        d = appr.step(tgt, now)
+        printer.show(zone, d, tgt)
+        if d["state"] in ("arrived", "failed"):
+            return d["state"], d["reason"]
+        _check("Move", loco.Move(d["vx"], d["vy"], d["vyaw"]))
+        next_t += PERIOD
+        sleep(max(0.0, next_t - clock()))
+
+
+def run(args, source=None, loco=None, *, clock=time.monotonic, sleep=time.sleep):
+    """メインループ。control 側で発行したイベント(moving/arrived/error)のリストを返す。
+    source / loco を渡すとテストで偽物を注入できる。"""
+    base = ZoneApproach(args.vx, args.vyaw, args.turn_offset, args.arrive_size,
+                        args.lost_timeout, args.move_timeout, args.search)
+    zone_fixed = args.zone.strip().upper() if args.zone else None
+    own_source = source is None
+    if own_source:
+        source = source_from_args(args)  # videohub のときだけ DDS を1回初期化する
+    rec = None
+    events = []
+    try:
+        rec = recognizer_from_args(args, source)
+        if zone_fixed and zone_fixed not in rec.zones:
+            raise PickMoveError(f"--zone {zone_fixed} が --zones {sorted(rec.zones)} に含まれていません。")
+        if args.execute:
+            print(SAFETY_NOTICE, flush=True)
+        if loco is None:
+            if args.execute:
+                loco = make_real_loco(args.domain, args.interface, init_dds=args.source != "videohub")
+            else:
+                print("[dry-run] ロボットにはコマンドを送りません(実機へ送るには --execute)。", flush=True)
+                loco = DryRunLoco()
+        if args.execute:
+            sleep(3.0)
+        deadline = clock() + args.max_seconds if args.max_seconds else None
+        rec.start()
+        try:
+            while deadline is None or clock() < deadline:
+                if zone_fixed:
+                    goal = {"box_id": None, "zone": zone_fixed}
+                else:
+                    goal = rec.pop_box(timeout=PERIOD)
+                    if goal is None:
+                        continue
+                zone = goal["zone"]
+                print(f"[箱] {goal['box_id']} を区画 {zone} へ運ぶ" if goal["box_id"]
+                      else f"[区画 {zone}] 箱を待たず直接向かう", flush=True)
+                ev = make_event("moving", goal["box_id"], zone, detail=f"区画 {zone} へ移動開始",
+                                run_id=rec.run_id, source="control",
+                                data={"from": "start", "to": zone})
+                post_event(args.server, ev)
+                events.append(ev)
+                t_move = clock()
+                state, reason = _approach(rec, loco, zone, base.fresh(), deadline, clock, sleep)
+                _check("StopMove", loco.StopMove())
+                if state == "arrived":
+                    if args.gesture == "wave":
+                        _check("WaveHand", loco.WaveHand())
+                    ev = make_event("arrived", goal["box_id"], zone, detail=f"区画 {zone} に到着",
+                                    run_id=rec.run_id, source="control",
+                                    data={"duration_ms": int((clock() - t_move) * 1000),
+                                          "gesture": args.gesture})
+                elif state == "failed":
+                    ev = make_event("error", goal["box_id"], zone, detail=f"移動失敗: {reason}",
+                                    run_id=rec.run_id, source="control",
+                                    error={"code": "MOVE_FAILED", "message": reason})
+                else:  # timeout: 全体の制限時間での中断。イベントは出さず終了
+                    print(f"[中断] {reason}", flush=True)
+                    break
+                post_event(args.server, ev)
+                events.append(ev)
+                if args.once or zone_fixed:
+                    break
+        except KeyboardInterrupt:
+            print("中断しました(停止コマンドを送ります)。", file=sys.stderr)
+            raise
+        finally:
+            # 正常・例外・Ctrl+C のどれでも必ず停止を送る
+            try:
+                loco.StopMove()
+            except Exception as e:
+                print(f"[警告] 最終の StopMove に失敗: {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
+    finally:
+        if rec is not None:
+            rec.stop(close_source=own_source)
+        elif own_source:
+            source.close()
+    return events
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="箱QR確定→区画マーカーへ接近→停止。既定は dry-run(--execute で実機へ送信)")
+    add_source_args(parser)
+    add_recognizer_args(parser)
+    parser.add_argument("--execute", action="store_true",
+                        help="実機へ移動コマンドを送る(付けなければ dry-run)")
+    parser.add_argument("--vx", type=float, default=0.2, help=f"前進速度 m/s(上限 {VX_LIMIT} に丸める)")
+    parser.add_argument("--vyaw", type=float, default=0.3, help=f"旋回速度 rad/s(上限 {VYAW_LIMIT} に丸める)")
+    parser.add_argument("--turn-offset", type=float, default=0.15, help="旋回を始める |offset| の閾値")
+    parser.add_argument("--arrive-size", type=float, default=0.25, help="到着とみなす size_ratio の閾値")
+    parser.add_argument("--lost-timeout", type=float, default=3.0, help="マーカーを見失って待つ秒数")
+    parser.add_argument("--move-timeout", type=float, default=30.0, help="1箱あたりの移動の制限秒数")
+    parser.add_argument("--search", action="store_true", help="見失ったらゆっくり旋回して探す")
+    parser.add_argument("--gesture", choices=("none", "wave"), default="none",
+                        help="到着後の動作(wave=手を振る)")
+    parser.add_argument("--once", action="store_true", help="1箱処理したら終了")
+    parser.add_argument("--max-seconds", type=float, default=None, help="全体の制限秒数(テスト用)")
+    parser.add_argument("--zone", type=str, default=None,
+                        help="箱のQRを待たず、この zone へ直接向かう(移動だけの単体確認用)")
+    return parser
+
+
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    args = build_parser().parse_args()
+    try:
+        run(args)
+    except (CameraError, PickMoveError) as e:
+        print(f"[エラー] {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
