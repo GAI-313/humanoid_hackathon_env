@@ -17,6 +17,7 @@ recognize = "python scripts/recognize.py"
 camera-check = "python scripts/camera_check.py"
 make-qr = "python scripts/make_qr.py"
 test-recognition = "python scripts/test_recognition.py"
+control-example = "python scripts/control_example.py"
 
 [dependencies]
 python = "3.10.*"

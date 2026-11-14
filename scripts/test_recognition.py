@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -18,11 +19,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import commands  # noqa: E402
 import events  # noqa: E402
 import recognize  # noqa: E402
 from camera_source import open_source  # noqa: E402
 from make_qr import encode_qr  # noqa: E402
-from qr_reader import StableDecoder, decode_qr, parse_payload  # noqa: E402
+from qr_reader import StableDecoder, decode_qr, locate, parse_payload, parse_zone_marker  # noqa: E402
+from recognition_link import Recognizer  # noqa: E402
 
 
 def scene(text, canvas=1200, qr_px=320, angle=8.0):
@@ -132,6 +135,150 @@ def test_file_source():
         s = open_source("file", path=str(p))
         assert s.read().shape == (10, 20, 3) and s.read() is not None
         s.close()
+
+
+def test_parse_zone_marker():
+    assert parse_zone_marker("ZONE:A") == "A"
+    assert parse_zone_marker("zone: b") == "B"
+    assert parse_zone_marker('{"zone_marker":"a"}') == "A"
+    for bad in ["", "B001:A", "hello", "{", '{"zone":"A"}', '{"zone_marker":1}', None]:
+        assert parse_zone_marker(bad) is None, bad
+    assert parse_payload("ZONE:A") is None
+    assert parse_payload('{"zone_marker":"A"}') is None
+
+
+def test_locate():
+    shape = (480, 640, 3)
+
+    def sq(cx, side=64.0, cy=240.0):
+        h = side / 2
+        return np.array([[cx - h, cy - h], [cx + h, cy - h], [cx + h, cy + h], [cx - h, cy + h]])
+
+    left, mid, right = (locate(sq(x), shape) for x in (100, 320, 540))
+    assert left["bearing"] == "left" and left["offset"] < -0.5, left
+    assert mid["bearing"] == "center" and abs(mid["offset"]) < 0.01, mid
+    assert right["bearing"] == "right" and right["offset"] > 0.5, right
+    assert abs(mid["size_ratio"] - 0.1) < 1e-6 and mid["distance_m"] is None
+    # 一辺0.10m, 水平画角90度, size_ratio 0.1 -> 0.10 / (2*1*0.1) = 0.5m
+    assert abs(locate(sq(320), shape, 0.10, 90.0)["distance_m"] - 0.5) < 0.01
+    assert locate(sq(320), shape, 0.10, None)["distance_m"] is None
+    assert locate(sq(320 + 0.15 * 320), shape)["bearing"] == "center"  # 境界 0.15 は center
+
+
+def _two_qr_scene():
+    """左に箱QR、右に区画マーカー(ZONE:A)を並べた画像。"""
+    img = np.full((700, 1400, 3), 128, np.uint8)
+    for text, x in (('{"box_id":"B001","zone":"A"}', 150), ("ZONE:A", 900)):
+        qr = cv2.resize(encode_qr(text, 600), (350, 350), interpolation=cv2.INTER_AREA)
+        img[175:525, x:x + 350] = qr
+    return img
+
+
+def _wait(cond, timeout=6.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return cond()
+
+
+class _CmdHandler(BaseHTTPRequestHandler):
+    received = []
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        _CmdHandler.received.append(json.loads(self.rfile.read(n)))
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *a):
+        pass
+
+
+def test_recognizer_box_and_target():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "two.png"
+        cv2.imwrite(str(p), _two_qr_scene())
+        src = open_source("file", path=str(p))
+        called = []
+        rec = Recognizer(src, on_box=lambda b, z: called.append((b, z)))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rec.start()
+            try:
+                assert _wait(lambda: called and rec.get_target("A")), (called, rec.stats())
+                time.sleep(0.5)
+            finally:
+                rec.stop(close_source=True)
+        assert called == [("B001", "A")], called
+        tgt = rec.get_target("A", max_age=60)
+        assert tgt["zone"] == "A" and tgt["bearing"] == "right" and tgt["offset"] > 0.3, tgt
+        assert tgt["distance_m"] is None and tgt["age_sec"] >= 0
+        assert rec.last_box()["box_id"] == "B001"
+        assert rec.pop_box()["zone"] == "A" and rec.pop_box() is None
+        assert rec.get_target("B") is None
+        assert rec.stats()["frames"] > 0
+
+
+def test_recognizer_command_url():
+    server = HTTPServer(("127.0.0.1", 0), _CmdHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _CmdHandler.received.clear()
+    url = f"http://127.0.0.1:{server.server_port}/command"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "two.png"
+            cv2.imwrite(str(p), _two_qr_scene())
+            src = open_source("file", path=str(p))
+            rec = Recognizer(src, command_url=url, marker_size_m=0.1, hfov_deg=90, target_hz=20)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rec.start()
+                try:
+                    kinds = lambda: {c["cmd"] for c in _CmdHandler.received}  # noqa: E731
+                    assert _wait(lambda: kinds() >= {"go_to", "target"}), _CmdHandler.received
+                finally:
+                    rec.stop(close_source=True)
+        goto = next(c for c in _CmdHandler.received if c["cmd"] == "go_to")
+        tgt = next(c for c in _CmdHandler.received if c["cmd"] == "target")
+        assert goto["box_id"] == "B001" and goto["zone"] == "A" and goto["v"] == 1
+        assert tgt["zone"] == "A" and tgt["visible"] is True and tgt["bearing"] == "right"
+        assert tgt["distance_m"] is not None and tgt["run_id"] == goto["run_id"]
+        lost = commands.make_target("A", None, "r")
+        assert lost["visible"] is False and lost["offset"] is None
+    finally:
+        server.shutdown()
+
+
+def test_on_box_exception_keeps_thread_alive():
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "two.png"
+        cv2.imwrite(str(p), _two_qr_scene())
+        src = open_source("file", path=str(p))
+        called = []
+
+        def boom(b, z):
+            called.append(b)
+            raise RuntimeError("テスト用の例外")
+
+        rec = Recognizer(src, on_box=boom)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rec.start()
+            try:
+                assert _wait(lambda: called)
+                n = rec.stats()["frames"]
+                assert _wait(lambda: rec.stats()["frames"] > n + 2)
+                assert rec._thread.is_alive()
+            finally:
+                rec.stop(close_source=True)
+        assert "テスト用の例外" in err.getvalue()
+
+
+def test_post_command_failure():
+    with contextlib.redirect_stderr(io.StringIO()):
+        assert commands.post_command("http://127.0.0.1:9/command", {"a": 1}, timeout=0.3) is False
+    assert commands.post_command(None, {}) is False
 
 
 def main() -> int:

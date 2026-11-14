@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""認識メイン: カメラでQRを読み、分類先(zone)を判定してイベントを出す/POSTする。
+"""認識メイン: カメラで箱のQRと区画マーカーを読み、イベント/指示を出す(Recognizer を使う薄いCLI)。
 
 例:
   python scripts/recognize.py --source webcam --show
   python scripts/recognize.py --source file --path work/qr/B001_A.png --max-seconds 3
   python scripts/recognize.py --source videohub -i eth0 --server http://localhost:8000/events
+  python scripts/recognize.py --source webcam --command-url http://localhost:8001/command --marker-size-cm 10 --hfov-deg 90
 """
 from __future__ import annotations
 
@@ -17,105 +18,76 @@ from pathlib import Path
 import cv2
 
 from camera_source import CameraError, add_source_args, source_from_args
-from events import make_event, post_event
-from qr_reader import StableDecoder, decode_qr, parse_payload
+from recognition_link import add_recognizer_args, build_event, recognizer_from_args  # noqa: F401
+
+GREEN, BLUE = (0, 255, 0), (255, 0, 0)  # BGR
 
 
-def build_event(text, zones, run_id=None):
-    """確定したQRテキストから scanned / error のイベントを作る。"""
-    parsed = parse_payload(text)
-    if parsed is None:
-        return make_event(
-            "error", detail=f"QRを解釈できません: {text!r}", run_id=run_id,
-            error={"code": "UNKNOWN_QR", "message": "形式不正"}, data={"qr_raw": text})
-    if parsed["zone"] not in zones:
-        return make_event(
-            "error", parsed["box_id"], None,  # 仕様: 定義外の zone は null で送る
-            detail=f"想定外のzone {parsed['zone']!r}: {text!r}", run_id=run_id,
-            error={"code": "UNKNOWN_QR", "message": f"zone {parsed['zone']} は想定外"},
-            data={"qr_raw": text})
-    return make_event(
-        "scanned", parsed["box_id"], parsed["zone"],
-        detail=f"QR読取成功 {parsed['box_id']} -> {parsed['zone']}", run_id=run_id,
-        data={"qr_raw": text})
-
-
-def _draw(frame, results, last_label):
-    for text, pts in results:
-        cv2.polylines(frame, [pts.astype("int32").reshape(-1, 1, 2)], True, (0, 255, 0), 3)
+def _draw(frame, dets, last_label):
+    for d in dets:
+        pts = d["points"]
+        zone = d["kind"] == "zone"
+        color = BLUE if zone else GREEN
+        if zone and d["loc"]:
+            label = f"ZONE {d['zone']} {d['loc']['bearing']} {d['loc']['offset']:.2f}"
+        else:
+            label = d["text"][:30]
+        cv2.polylines(frame, [pts.astype("int32").reshape(-1, 1, 2)], True, color, 3)
         x, y = int(pts[0][0]), int(pts[0][1])
-        cv2.putText(frame, text[:30], (x, max(y - 8, 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, label, (x, max(y - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     if last_label:
         cv2.putText(frame, last_label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 200, 255), 2)
 
 
 def run(args, source=None):
     """メインループ。発行したイベントのリストを返す(テストで使う)。"""
-    zones = {z.strip().upper() for z in args.zones.split(",") if z.strip()}
     own_source = source is None
     if own_source:
         source = source_from_args(args)
-    save_dir = Path(args.save_dir) if args.save_dir else None
+    save_dir = Path(args.save_dir) if getattr(args, "save_dir", None) else None
     if save_dir:
         save_dir.mkdir(parents=True, exist_ok=True)
-    decoder = StableDecoder(confirm_frames=3, cooldown_sec=5.0)
-    emitted = []
-    run_id = datetime.now().strftime("%Y%m%d-%H%M")
+
+    def save(ev, frame):
+        name = f"{datetime.now():%H%M%S}_{ev['event']}_{ev['box_id'] or 'unknown'}.jpg"
+        cv2.imwrite(str(save_dir / name), frame)
+
+    rec = recognizer_from_args(args, source, on_event=save if save_dir else None)
     start = time.monotonic()
-    last_ok = time.monotonic()
-    last_warn = 0.0
-    last_label = ""
-    is_file = getattr(args, "source", "") == "file"
+    rec.start()
     try:
         while True:
-            now = time.monotonic()
-            if args.max_seconds and now - start >= args.max_seconds:
+            if args.max_seconds and time.monotonic() - start >= args.max_seconds:
                 break
-            frame = source.read()
-            if frame is None:
-                if now - last_ok > 3.0 and now - last_warn > 3.0:
-                    print(f"[警告] {now - last_ok:.0f}秒間フレームを取得できていません。"
-                          "カメラ接続・取得元の設定を確認してください。", file=sys.stderr)
-                    last_warn = now
-                time.sleep(0.02)
-                continue
-            last_ok = now
-            results = decode_qr(frame)
-            for text in decoder.update([t for t, _ in results], now=now):
-                ev = build_event(text, zones, run_id)
-                post_event(args.server, ev, timeout=1.0)
-                emitted.append(ev)
-                last_label = f"{ev['event']}: {ev['box_id']} {ev['zone']}"
-                if save_dir:
-                    name = f"{datetime.now():%H%M%S}_{ev['event']}_{ev['box_id'] or 'unknown'}.jpg"
-                    cv2.imwrite(str(save_dir / name), frame)
             if args.show:
-                _draw(frame, results, last_label)
-                cv2.imshow("recognize (q: quit)", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                view = rec.latest_view()  # cv2.imshow はメインスレッドで行う
+                if view is not None:
+                    frame = view[0].copy()
+                    evs = rec.events()
+                    label = f"{evs[-1]['event']}: {evs[-1]['box_id']} {evs[-1]['zone']}" if evs else ""
+                    _draw(frame, view[1], label)
+                    cv2.imshow("recognize (q: quit)", frame)
+                if cv2.waitKey(30) & 0xFF == ord("q"):
                     break
-            if is_file:
-                time.sleep(0.03)
+            else:
+                time.sleep(0.05)
     except KeyboardInterrupt:
         print("中断しました。", file=sys.stderr)
     finally:
-        if own_source:
-            source.close()
+        rec.stop(close_source=own_source)
         if args.show:
             cv2.destroyAllWindows()
-    return emitted
+    return rec.events()
 
 
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="箱のQRを読んで分類先(zone)を判定する")
+    parser = argparse.ArgumentParser(description="箱のQRと区画マーカーを読んで分類先(zone)を判定する")
     add_source_args(parser)
-    parser.add_argument("--server", type=str, default=None,
-                        help="イベント送信先(例 http://localhost:8000/events)。未指定なら出力のみ")
-    parser.add_argument("--zones", type=str, default="A,B", help="想定する zone(カンマ区切り)")
-    parser.add_argument("--show", action="store_true", help="ウィンドウ表示(q で終了)")
+    add_recognizer_args(parser)
+    parser.add_argument("--show", action="store_true",
+                        help="ウィンドウ表示(q で終了)。箱QRは緑、区画マーカーは青")
     parser.add_argument("--save-dir", type=str, default=None, help="確定時のフレーム保存先")
     parser.add_argument("--max-seconds", type=float, default=None, help="指定秒数で自動終了(テスト用)")
     args = parser.parse_args()

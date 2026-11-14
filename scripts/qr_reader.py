@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 
@@ -78,9 +79,35 @@ def decode_qr(frame):
 _SIMPLE = re.compile(r"^\s*([A-Za-z0-9_\-]+)\s*:\s*([A-Za-z0-9_\-]+)\s*$")
 
 
-def parse_payload(text):
-    """{"box_id":"B001","zone":"A"} または B001:A を解釈する。不可なら None。"""
+_ZONE_MARKER = re.compile(r"^\s*ZONE\s*:\s*([A-Za-z0-9_\-]+)\s*$", re.IGNORECASE)
+
+
+def parse_zone_marker(text):
+    """区画マーカー(`ZONE:A` または {"zone_marker":"A"})なら大文字化した zone を返す。違えば None。"""
     if not isinstance(text, str):
+        return None
+    s = text.strip()
+    if s.startswith("{"):
+        try:
+            obj = json.loads(s)
+        except ValueError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        zone = obj.get("zone_marker")
+        if not isinstance(zone, str) or not zone.strip():
+            return None
+        return zone.strip().upper()
+    m = _ZONE_MARKER.match(s)
+    return m.group(1).upper() if m else None
+
+
+def parse_payload(text):
+    """{"box_id":"B001","zone":"A"} または B001:A を解釈する。不可なら None。
+    区画マーカー(ZONE:A など)は箱ではないので None。"""
+    if not isinstance(text, str):
+        return None
+    if parse_zone_marker(text) is not None:
         return None
     s = text.strip()
     if s.startswith("{"):
@@ -102,6 +129,34 @@ def parse_payload(text):
     if not box or not zone:
         return None
     return {"box_id": box, "zone": zone}
+
+
+def locate(points, frame_shape, marker_size_m=None, hfov_deg=None):
+    """QRの4隅(4x2, 画素)から画像内の位置を出す。
+    offset: 画像中心からの水平ずれを -1.0〜+1.0 に正規化(右が正)。
+    bearing: "left"/"center"/"right"(|offset|<=0.15 を center)。
+    size_ratio: QRの辺の平均長 / 画像幅。
+    distance_m: marker_size_m と hfov_deg が両方あるときだけ、ピンホール近似
+      marker_size_m / (2*tan(hfov/2)*size_ratio) で推定。無ければ None。"""
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    width = float(frame_shape[1])
+    cx = float(pts[:, 0].mean())
+    offset = max(-1.0, min(1.0, (cx - width / 2.0) / (width / 2.0)))
+    sides = [float(np.linalg.norm(pts[i] - pts[(i + 1) % len(pts)])) for i in range(len(pts))]
+    size_ratio = (sum(sides) / len(sides)) / width
+    if abs(offset) <= 0.15:
+        bearing = "center"
+    else:
+        bearing = "right" if offset > 0 else "left"
+    distance = None
+    if marker_size_m and hfov_deg and size_ratio > 0 and 0 < hfov_deg < 180:
+        distance = float(marker_size_m) / (2.0 * math.tan(math.radians(hfov_deg) / 2.0) * size_ratio)
+    return {
+        "offset": round(offset, 4),
+        "bearing": bearing,
+        "size_ratio": round(size_ratio, 4),
+        "distance_m": None if distance is None else round(distance, 3),
+    }
 
 
 class StableDecoder:
