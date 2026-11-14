@@ -18,6 +18,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 from commands import make_go_to, make_target, post_command
 from events import make_event, post_event
@@ -45,17 +46,39 @@ def build_event(text, zones, run_id=None):
         data={"qr_raw": text})
 
 
+def build_verify_event(result, run_id=None):
+    """GeminiVerifier の結果からイベントを作る。match -> verified、mismatch -> CONTENT_MISMATCH の error。
+    skipped / error はイベントにしない(None)。"""
+    status = result.get("status")
+    res = result.get("result") or {}
+    if status not in ("match", "mismatch"):
+        return None
+    data = {"observed": res.get("observed"), "confidence": res.get("confidence"),
+            "model": result.get("model"), "elapsed_ms": result.get("elapsed_ms")}
+    if status == "match":
+        return make_event("verified", result["box_id"], result["zone"],
+                          detail=f"見た目の照合OK: {res.get('observed')}", run_id=run_id, data=data)
+    data["expected"] = result.get("expected")
+    return make_event("error", result["box_id"], result["zone"],
+                      detail=f"見た目が台帳と不一致: {res.get('observed')}", run_id=run_id,
+                      error={"code": "CONTENT_MISMATCH", "message": res.get("reason")}, data=data)
+
+
 class Recognizer:
     def __init__(self, source, zones=("A", "B"), server=None, command_url=None, on_box=None,
                  marker_size_m=None, hfov_deg=None, target_hz=2.0, *, run_id=None,
-                 on_event=None, confirm_frames=3, cooldown_sec=5.0):
-        """source: read()/close() を持つ取得元。on_event(ev, frame) は発行イベントごとに呼ばれる。"""
+                 on_event=None, confirm_frames=3, cooldown_sec=5.0, verifier=None):
+        """source: read()/close() を持つ取得元。on_event(ev, frame) は発行イベントごとに呼ばれる。
+        verifier: 箱のQR確定時に見た目を照合する GeminiVerifier(任意)。"""
         self._source = source
         self.zones = {str(z).strip().upper() for z in zones if str(z).strip()}
         self.server = server
         self.command_url = command_url
         self.on_box = on_box
         self.on_event = on_event
+        self.verifier = verifier
+        if verifier is not None:
+            verifier.on_result = self._on_verify
         self.marker_size_m = marker_size_m
         self.hfov_deg = hfov_deg
         self.target_interval = 1.0 / target_hz if target_hz and target_hz > 0 else 0.0
@@ -92,6 +115,11 @@ class Recognizer:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
+        if self.verifier is not None:
+            try:
+                self.verifier.close()
+            except Exception as e:
+                print(f"[警告] 照合器の停止で例外: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         if close_source:
             self._source.close()
 
@@ -168,6 +196,7 @@ class Recognizer:
 
     def _process(self, frame, now):
         dets, box_texts, seen = [], [], {}
+        box_points = {}
         for text, pts in decode_qr(frame):
             zone = parse_zone_marker(text)
             if zone is not None:
@@ -177,6 +206,7 @@ class Recognizer:
                     seen[zone] = loc
             else:
                 box_texts.append(text)
+                box_points.setdefault(text, pts)
                 dets.append({"kind": "box", "text": text, "points": pts, "zone": None, "loc": None})
         with self._lock:
             self._frames += 1
@@ -186,10 +216,26 @@ class Recognizer:
             for z, loc in seen.items():
                 self._obs[z] = (now, loc)
         for text in self._decoder.update(box_texts, now=now):
-            self._handle_box(text, frame, now)
+            self._handle_box(text, frame, now, box_points.get(text))
         self._post_target(seen, now)
 
-    def _handle_box(self, text, frame, now):
+    def _on_verify(self, result):
+        """照合結果(ワーカースレッドから呼ばれる)をイベントにして送る。"""
+        try:
+            ev = build_verify_event(result, self.run_id)
+            if ev is None:
+                if not result.get("quiet"):
+                    print(f"[照合 {result.get('status')}] {result.get('box_id')}: {result.get('error')}",
+                          file=sys.stderr, flush=True)
+                return
+            post_event(self.server, ev, timeout=1.0)
+            with self._lock:
+                self._events.append(ev)
+                del self._events[:-1000]
+        except Exception as e:
+            print(f"[警告] 照合結果の処理で例外: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+    def _handle_box(self, text, frame, now, points=None):
         ev = build_event(text, self.zones, self.run_id)
         post_event(self.server, ev, timeout=1.0)
         with self._lock:
@@ -206,6 +252,12 @@ class Recognizer:
         with self._lock:
             self._last_box = box
         self._queue.put(dict(box))
+        if self.verifier is not None:
+            try:
+                self.verifier.submit(box["box_id"], box["zone"], frame.copy(), points)
+            except Exception as e:  # 照合の失敗で認識スレッドを止めない
+                print(f"[警告] 見た目の照合の依頼で例外(認識は継続): {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
         if self.on_box:
             try:
                 self.on_box(box["box_id"], box["zone"])
@@ -254,11 +306,29 @@ def add_recognizer_args(parser) -> None:
                         help="区画マーカーQRの一辺(cm)。--hfov-deg と併用で距離を推定")
     parser.add_argument("--hfov-deg", type=float, default=None, help="カメラの水平画角(度)")
     parser.add_argument("--target-hz", type=float, default=2.0, help="target 指示の送信上限(Hz)")
+    parser.add_argument("--gemini", action="store_true",
+                        help="箱のQR確定時に Gemini で見た目を台帳と照合する(要 環境変数 GEMINI_API_KEY)")
+    parser.add_argument("--catalog", type=str, default=str(Path(__file__).resolve().parent / "catalog.json"),
+                        help="見た目の台帳 JSON(--gemini 用)")
+    parser.add_argument("--gemini-model", type=str, default=None,
+                        help="Gemini のモデル名(既定: 環境変数 GEMINI_MODEL、無ければ gemini-3.5-flash-lite)")
+    parser.add_argument("--gemini-timeout", type=float, default=8.0, help="Gemini の HTTP タイムアウト(秒)")
+    parser.add_argument("--gemini-endpoint", type=str, default=None, help="Gemini のエンドポイント(テスト用)")
 
 
 def recognizer_from_args(args, source, **extra):
     zones = [z for z in str(getattr(args, "zones", "A,B")).split(",") if z.strip()]
     cm = getattr(args, "marker_size_cm", None)
+    if getattr(args, "gemini", False) and "verifier" not in extra:
+        from gemini_verify import GeminiVerifier, load_catalog
+        try:
+            catalog = load_catalog(args.catalog)
+        except (OSError, ValueError) as e:
+            print(f"[警告] 台帳を読めません({e})。見た目の照合は行いません。", file=sys.stderr, flush=True)
+            catalog = {}
+        extra["verifier"] = GeminiVerifier(
+            catalog, model=getattr(args, "gemini_model", None), endpoint=getattr(args, "gemini_endpoint", None),
+            timeout=getattr(args, "gemini_timeout", 8.0))
     return Recognizer(
         source, zones=zones, server=getattr(args, "server", None),
         command_url=getattr(args, "command_url", None),

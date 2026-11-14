@@ -8,13 +8,14 @@
 
 | 項目 | 状態 | 確認方法 |
 |---|---|---|
-| QRの読取と分類先の判定 | 動作確認済み | `scripts/test_recognition.py` が 16/16 成功 |
+| QRの読取と分類先の判定 | 動作確認済み | `scripts/test_recognition.py` が 25/25 成功 |
 | receiver への送信（`scanned` / `error`） | 動作確認済み | ローカルの receiver が 201 を返し、`logs/events.jsonl` に保存された |
 | 区画マーカー（`ZONE:A`）の認識と位置の算出 | 動作確認済み | 合成画像で左右のずれと大きさが期待どおり |
 | 制御（担当A）への指示（`go_to` / `target`） | 動作確認済み（受け側は見本） | `control_example.py --listen` が受信した |
 | 担当A の実コードとの結合 | **未着手** | A のスクリプトが main にまだ無い |
 | PC内蔵カメラからの取得（`webcam`） | 動作確認済み | 640x480、約15fps |
 | R1 頭部カメラからの取得（`videohub`） | 実機で確認済み | `camera-check --source videohub` で画像を保存できた（解像度と fps の記録は未取得） |
+| Gemini による見た目の照合（`--gemini`） | 偽サーバーで動作確認済み、**実際の API は未確認** | 下の「Gemini による見た目の照合」 |
 | 認識と移動の結合（`pick_move.py`） | dry-run で動作確認済み、**実機は未確認** | 下の「次にやること」2 |
 | R1 の UDP 配信の受信（`udp`） | 未確認（予備） | `videohub` で取れたので当面は不要 |
 | pixi 環境での実行 | **未確認** | 確認はシステムの Python 3.12 / OpenCV 5.0 で行った |
@@ -39,12 +40,14 @@ R1 頭部カメラ ─(有線LAN・DDS)─▶ camera_source.py ─▶ qr_reader.
 | `scripts/recognize.py` | `Recognizer` を使う CLI |
 | `scripts/qr_survey.py` | 読取成功率の計測。結果を `work/qr_survey.csv` に追記する |
 | `scripts/pick_move.py` | 認識と移動の結合。箱の QR が確定したら区画マーカーへ向かう。既定はロボットを動かさない |
+| `scripts/gemini_verify.py` | Gemini による見た目の照合。単体でも試せる |
+| `scripts/catalog.json` | 箱ごとの「期待する見た目」の台帳（見本） |
 | `scripts/r1_clients.py` | R1 用の `R1LocoClient`（スキル同梱のものをコピー） |
 | `scripts/camera_check.py` | 取得元の診断。解像度・fps・成功率を表示し、1枚を `work/camera_check.jpg` に保存する |
 | `scripts/make_qr.py` | テスト用QRの生成（`work/qr/` に出力） |
 | `scripts/test_recognition.py` | 実機なしの自己テスト |
 
-`pixi.toml` の `[tasks]` に `recognize` / `camera-check` / `make-qr` / `test-recognition` / `control-example` / `qr-survey` / `pick-move` を追加しました。依存パッケージは変えていません。
+`pixi.toml` の `[tasks]` に `recognize` / `camera-check` / `make-qr` / `test-recognition` / `control-example` / `qr-survey` / `pick-move` / `gemini-verify` を追加しました。依存パッケージは変えていません。
 
 ## R1 のカメラ映像の取り方
 
@@ -127,13 +130,33 @@ pixi run recognize --source webcam --show --command-url http://localhost:8001/co
 
 `scripts/control_example.py` の `decide()` が、観測から「探索・左へ旋回・右へ旋回・前進・到着」を決める見本です。`loco.Move()` と `StopMove()` を書く場所をコメントで示してあります。
 
+## Gemini による見た目の照合
+
+分類先の判定は QR だけで行います。Gemini は追加の確認で、箱の QR が確定した瞬間の画像から「台帳に書いた見た目と合っているか」を判定します。`recognize` や `pick-move` に `--gemini` を付けたときだけ動きます。
+
+- 送るのは、QR の周辺を切り出して長辺 768px 以下に縮めた画像1枚です。周りの人が写り込む範囲を減らすためです。
+- 台帳は `scripts/catalog.json` です。箱ID ごとに `expected`（期待する見た目）を書きます。いま入っているのは見本なので、実際の箱の特徴に書き換えてください。
+- 合えば `verified` イベント、合わなければ `error`（`CONTENT_MISMATCH`）を receiver へ送ります。
+- 照合は別スレッドで行います。タイムアウト（既定8秒）、API の失敗、キー未設定、台帳に無い箱のいずれでも、QR の読取と移動は止まりません。
+- API キーは環境変数 `GEMINI_API_KEY` からだけ読みます。コードにもログにも出しません。リポジトリには絶対に入れないでください。
+- モデルは `gemini-3.5-flash-lite` が既定で、`--gemini-model` で変えられます。SDK は使わず、標準ライブラリで Interactions API（`/v1beta/interactions`）を呼びます。
+
+**実際の API ではまだ1回も呼んでいません。** 応答の JSON の形を公式ページから確定できなかったため、考えられる5通りの形に対応させてあります。キーを設定したら、まず単体で確かめてください。判定を取り出せなかった場合は、応答の生 JSON が表示されます。
+
+```bash
+pixi run gemini-verify --image work/camera_check.jpg --box-id B001 --dry-run
+pixi run gemini-verify --image work/camera_check.jpg --box-id B001
+```
+
+1行目は送る本文を表示するだけで、API は呼びません。
+
 ## ほかの担当と決めること
 
 | 相手 | 決めること |
 |---|---|
 | A（制御） | 同じプロセスに組み込むか、HTTP で受けるか。到着の判定（`size_ratio` の閾値）をどちらが持つか。`moving` / `arrived` イベントは A が送る |
-| C（ダッシュボード） | receiver を動かす PC の IP。`pixi.toml` の `[tasks]` を双方が編集しているので、main に入れる順番 |
-| D（PM・デモ） | 印刷済みの箱の QR の中身が `{"box_id":"B001","zone":"A"}` か `B001:A` になっているか。区画マーカー（`ZONE:A` / `ZONE:B`）の印刷と、貼る高さ・大きさ。実機の時間割（カメラの確認に15分ほど） |
+| C（ダッシュボード） | `CONTENT_MISMATCH` を誤出荷アラートの対象に加えるか（いまは `UNKNOWN_QR` だけ）。`verified` はタイムラインにだけ出る。receiver を動かす PC の IP。`pixi.toml` の `[tasks]` を双方が編集しているので、main に入れる順番 |
+| D（PM・デモ） | 台帳（`scripts/catalog.json`）に書く、実際の箱の見た目。印刷済みの箱の QR の中身が `{"box_id":"B001","zone":"A"}` か `B001:A` になっているか。区画マーカー（`ZONE:A` / `ZONE:B`）の印刷と、貼る高さ・大きさ。実機の時間割（カメラの確認に15分ほど） |
 | スタッフ | `videohub` が応答しない場合の、R1 のアプリでのサービス状態の確認 |
 
 ## 次にやること
@@ -156,7 +179,7 @@ pixi run recognize --source webcam --show --command-url http://localhost:8001/co
    3. 接地して、周囲を2m以上空けて同じコマンドを実行する。問題なければ `--zone` を外し、箱の QR から通す。
 3. **到着の閾値を実測で決める**。既定の `--arrive-size 0.25` は仮の値です。1 の計測で、止まりたい距離での `size_ratio` を調べて置き換えます。QR の白い余白は大きさに含まれないので、見た目より少し小さく出ます。
 4. **制御（担当A）と役割を合わせる**。`pick_move.py` は A の `go_to(zone)` に当たる部分を先に形にしたものです。A のスクリプトができたら、どちらを本番にするかを決めます。腕で指し示す動作は入っていません（到着後の `--gesture wave` のみ）。
-5. **Gemini による照合（Could）**は未着手です。QR の流れが実機で通ってから、停止位置の静止画を1枚だけ送る形で足す想定です。
+5. **Gemini の照合を実際の API で確かめる**。`GEMINI_API_KEY` を設定し、上の「Gemini による見た目の照合」のコマンドを実行します。通ったら、台帳を実際の箱に合わせ、会場の回線での所要時間を見ます。
 
 ## 既知の注意点
 
@@ -177,6 +200,7 @@ pixi run recognize --source webcam --show --command-url http://localhost:8001/co
 - 合成した QR 画像で、正常系と想定外 QR の両方が receiver に保存されることを確認した。
 - 別の PC で `camera-check --source videohub` を実行し、R1 の頭部カメラの画像を保存できた。
 - 読取成功率の計測（`qr_survey.py`）と、認識と移動の結合（`pick_move.py`）を追加した。
+- Gemini による見た目の照合（`--gemini`）を追加した。Gemini API は Interactions API が標準になっていたので、そちらで実装した。実際の API は呼んでおらず、偽のサーバーで確認した。
 - 区画マーカーの認識と、制御（担当A）への指示の受け渡し（`Recognizer` と `--command-url`）を追加した。合成画像で、箱の確定から `go_to`、`target` の受信までを確認した。
 
 ## 参照
