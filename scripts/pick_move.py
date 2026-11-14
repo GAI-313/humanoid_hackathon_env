@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 import sys
 import time
+import os
 import urllib.error
 import urllib.request
 
@@ -31,53 +32,65 @@ sys.path.append(str(Path(__file__).parent))
 class EventReporter:
     """可視化ツール (C 担当) へのイベント送信を担当するクラス。
 
-    送信先サーバーが起動していなくても処理をブロック・停止させず、安全にスキップします。
+    仕様: docs/log_schema.md
+    受信側 (dashboard/receiver.py) がバリデーションを行うため、厳密なスキーマで POST します。
+    サーバーが起動していなくても処理をブロック・停止させず、安全にスキップします。
     """
 
-    def __init__(self, endpoint_url: str = "http://127.0.0.1:8000/events", enabled: bool = True):
+    def __init__(
+        self,
+        endpoint_url: str = "http://127.0.0.1:8000/events",
+        enabled: bool = True,
+        run_id: str | None = None,
+    ):
         self.endpoint_url = endpoint_url
         self.enabled = enabled
+        self.run_id = run_id or os.environ.get("RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M")
 
-    def send(self, event_type: str, box_id: str, zone: str, detail: str = "") -> dict:
-        """イベント JSON を生成して送信する。
-
-        形式:
-        {
-          "ts": "2026-11-15T10:30:00",
-          "robot": "R1",
-          "event": "scanned | moving | arrived | error",
-          "box_id": "B001",
-          "zone": "A",
-          "detail": "任意メッセージ"
-        }
-        """
+    def send(
+        self,
+        event_type: str,
+        box_id: str | None,
+        zone: str | None,
+        detail: str | None = None,
+        data: dict | None = None,
+        error: dict | None = None,
+    ) -> dict:
+        """イベント JSON を生成して送信する (docs/log_schema.md 準拠)。"""
         payload = {
-            "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "v": 1,
+            "ts": datetime.now().astimezone().isoformat(timespec="milliseconds"),
             "robot": "R1",
-            "event": event_type,
+            "run_id": self.run_id,
             "box_id": box_id,
+            "event": event_type,
             "zone": zone,
-            "detail": detail,
+            "source": "control",
         }
+        if detail is not None:
+            payload["detail"] = detail
+        if data is not None:
+            payload["data"] = data
+        if error is not None:
+            payload["error"] = error
 
-        print(f"[Event] ({event_type.upper()}) Box:{box_id} -> Zone:{zone} | {detail}")
+        print(f"[Event] ({event_type.upper()}) Box:{box_id} -> Zone:{zone} | {detail or ''}")
 
         if not self.enabled:
             return payload
 
         try:
-            req_data = json.dumps(payload).encode("utf-8")
+            req_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             req = urllib.request.Request(
                 self.endpoint_url,
                 data=req_data,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            # タイムアウト 0.5 秒で非同期的・安全に送信
             with urllib.request.urlopen(req, timeout=0.5) as resp:
                 pass
         except (urllib.error.URLError, TimeoutError, OSError):
-            # ダッシュボードサーバーが未起動の場合は何もしない（開発を妨げない）
+            # ダッシュボードサーバーが未起動の場合は安全にスキップ
             pass
 
         return payload
@@ -92,11 +105,12 @@ class PickRobotController:
         domain: int = 1,
         dry_run: bool = False,
         event_url: str = "http://127.0.0.1:8000/events",
+        send_events: bool = True,
     ):
         self.interface = interface
         self.domain = domain
         self.dry_run = dry_run
-        self.reporter = EventReporter(endpoint_url=event_url, enabled=not dry_run)
+        self.reporter = EventReporter(endpoint_url=event_url, enabled=send_events)
 
         self.loco = None
         self.arm = None
@@ -221,8 +235,16 @@ class PickRobotController:
         print(f"[*] Mission Start: Moving Box '{box_id}' to Zone '{zone_clean}'")
         print(f"=======================================================")
 
-        # 1. 移動開始イベント送信 & 発話
-        self.reporter.send("moving", box_id, zone_clean, f"Starting move to Zone {zone_clean}")
+        t_start = time.time()
+
+        # 1. 移動開始イベント送信 & 発話 (docs/log_schema.md 準拠)
+        self.reporter.send(
+            "moving",
+            box_id=box_id,
+            zone=zone_clean if zone_clean in ("A", "B", "C") else None,
+            detail=f"区画{zone_clean}へ移動",
+            data={"from": "start", "to": zone_clean},
+        )
         self.speak(f"Moving box {box_id} to zone {zone_clean}.")
         time.sleep(0.5)
 
@@ -253,15 +275,29 @@ class PickRobotController:
                 self.walk(vx=-0.25, vy=0.0, vyaw=0.0, duration=3.0)
 
             else:
-                # 未知の区画: エラーイベント送信
-                self.reporter.send("error", box_id, zone_clean, f"Unknown target zone: {zone_clean}")
+                # 未知の区画: エラーイベント送信 (誤出荷アラート対象 UNKNOWN_QR)
+                self.reporter.send(
+                    "error",
+                    box_id=box_id,
+                    zone=None,
+                    detail=f"想定外QR: 未定義区画 {zone_clean}",
+                    error={"code": "UNKNOWN_QR", "message": f"zone '{zone_clean}' is not defined"},
+                    data={"target": zone_clean},
+                )
                 self.speak("Error. Unknown destination zone.")
                 return
 
             # 3. 到着
             self.stop()
+            duration_ms = int((time.time() - t_start) * 1000)
             print(f"[Mission] Arrived at Zone {zone_clean}.")
-            self.reporter.send("arrived", box_id, zone_clean, f"Arrived at Zone {zone_clean}")
+            self.reporter.send(
+                "arrived",
+                box_id=box_id,
+                zone=zone_clean if zone_clean in ("A", "B", "C") else None,
+                detail=f"腕で指し示し完了 (所要 {duration_ms / 1000:.1f}s)",
+                data={"duration_ms": duration_ms, "gesture": "point"},
+            )
             self.speak(f"Arrived at zone {zone_clean}. Sorting completed.")
             time.sleep(1.0)
 

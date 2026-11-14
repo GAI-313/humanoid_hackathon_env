@@ -22,15 +22,25 @@ class TestPickMove(unittest.TestCase):
         self.controller = PickRobotController(dry_run=True, event_url="http://127.0.0.1:9999/events")
 
     def test_event_reporter_payload(self):
-        """イベント JSON のフォーマット検証。"""
-        reporter = EventReporter(enabled=False)
-        payload = reporter.send("scanned", "BOX-100", "A", "Test detail")
+        """イベント JSON のフォーマット検証 (docs/log_schema.md 準拠)。"""
+        reporter = EventReporter(enabled=False, run_id="20261115-test")
+        payload = reporter.send(
+            "moving",
+            box_id="BOX-100",
+            zone="A",
+            detail="区画Aへ移動",
+            data={"from": "start", "to": "A"},
+        )
 
+        self.assertEqual(payload["v"], 1)
         self.assertEqual(payload["robot"], "R1")
-        self.assertEqual(payload["event"], "scanned")
+        self.assertEqual(payload["run_id"], "20261115-test")
+        self.assertEqual(payload["source"], "control")
+        self.assertEqual(payload["event"], "moving")
         self.assertEqual(payload["box_id"], "BOX-100")
         self.assertEqual(payload["zone"], "A")
-        self.assertIn("T", payload["ts"])
+        self.assertEqual(payload["data"]["to"], "A")
+        self.assertIn("+", payload["ts"])  # タイムゾーン検証
 
     def test_go_to_zone_a(self):
         """Zone A へのドライラン移動シーケンス検証。"""
