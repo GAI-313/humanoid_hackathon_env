@@ -1,3 +1,5 @@
+![Logo](docs/B1C63B70-0118-48BA-8E98-DC4ADD1B25CB.png)
+
 # humanoid_hackathon_env セットアップガイド <a id="title"></a>
 
 本リポジトリは，Unitree Robotics 社の人形ロボット向け Python 開発キットである `unitree_sdk2_python` （`unitree_sdk2py`）を，パッケージマネージャー `pixi` を用いてクロスプラットフォームに構築・実行するための開発環境です．
