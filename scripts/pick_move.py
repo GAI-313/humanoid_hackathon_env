@@ -1,414 +1,339 @@
-#!/usr/bin/env python3
-"""担当A: ロボット制御モジュール (scripts/pick_move.py)
+﻿#!/usr/bin/env python3
+"""認識と移動・把持の結合: 箱のQRが確定したら腕で把持し、その zone の区画マーカー(QR `ZONE:A`)を
+カメラで追いながら近づき、十分大きく見えたら停止して腕を解放する。
 
-Unitree R1 / G1 の高レベル制御スクリプト:
-- 移動制御 (R1LocoClient): 区画A/Bへの移動、スタート地点への復帰、安全停止
-- 腕プリセット動作 (R1ArmActionClient): 区画の指し示し (ID 31)、完了手振り (ID 25)、初期姿勢復帰 (ID 99)
-- 音声合成 (AudioClient): 状態変化の英語アナウンス (speaker_id=1)
-- 可視化ツール連携: C 担当のダッシュボード (http://<host>:8000/events) へのイベント通知
-
-実行モード:
-- ドライラン (DDS 通信なし): python scripts/pick_move.py --dry-run --zone A
-- モック環境 (PC 単体):      python scripts/pick_move.py --domain 1 --zone A
-- 実機環境 (当日):          python scripts/pick_move.py --domain 0 -i Ethernet --zone A
-- 対話型デバッグモード:       python scripts/pick_move.py --dry-run --interactive
+既定は dry-run(ロボットに一切コマンドを送らず、送るはずだった Move 等を print するだけ)。
+実機へ送るのは --execute を付けたときだけ。
 """
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
-import json
-from pathlib import Path
 import sys
 import time
-import os
-import urllib.error
-import urllib.request
+from pathlib import Path
 
-# scripts/ ディレクトリを sys.path に追加して r1_clients を参照可能にする
-sys.path.append(str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from arm_controller import ArmController  # noqa: E402
+from camera_source import CameraError, add_source_args, source_from_args  # noqa: E402
+from events import make_event, post_event  # noqa: E402
+from recognition_link import add_recognizer_args, recognizer_from_args  # noqa: E402
 
-class EventReporter:
-    """可視化ツール (C 担当) へのイベント送信を担当するクラス。
-
-    仕様: docs/log_schema.md
-    受信側 (dashboard/receiver.py) がバリデーションを行うため、厳密なスキーマで POST します。
-    サーバーが起動していなくても処理をブロック・停止させず、安全にスキップします。
-    """
-
-    def __init__(
-        self,
-        endpoint_url: str = "http://127.0.0.1:8000/events",
-        enabled: bool = True,
-        run_id: str | None = None,
-    ):
-        self.endpoint_url = endpoint_url
-        self.enabled = enabled
-        self.run_id = run_id or os.environ.get("RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M")
-
-    def send(
-        self,
-        event_type: str,
-        box_id: str | None,
-        zone: str | None,
-        detail: str | None = None,
-        data: dict | None = None,
-        error: dict | None = None,
-    ) -> dict:
-        """イベント JSON を生成して送信する (docs/log_schema.md 準拠)。"""
-        payload = {
-            "v": 1,
-            "ts": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-            "robot": "R1",
-            "run_id": self.run_id,
-            "box_id": box_id,
-            "event": event_type,
-            "zone": zone,
-            "source": "control",
-        }
-        if detail is not None:
-            payload["detail"] = detail
-        if data is not None:
-            payload["data"] = data
-        if error is not None:
-            payload["error"] = error
-
-        print(f"[Event] ({event_type.upper()}) Box:{box_id} -> Zone:{zone} | {detail or ''}")
-
-        if not self.enabled:
-            return payload
-
-        try:
-            req_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            req = urllib.request.Request(
-                self.endpoint_url,
-                data=req_data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=0.5) as resp:
-                pass
-        except (urllib.error.URLError, TimeoutError, OSError):
-            # ダッシュボードサーバーが未起動の場合は安全にスキップ
-            pass
-
-        return payload
+VX_LIMIT = 0.3
+VYAW_LIMIT = 0.5
+PERIOD = 0.2
+PRINT_INTERVAL = 1.0
 
 
-class PickRobotController:
-    """R1 ロボットのピッキング・分類移動および腕動作を管理するコントローラー。"""
+class PickMoveError(RuntimeError):
+    """実行できない状況(SDK 未導入・引数不正など)。日本語の原因を添える。"""
 
-    def __init__(
-        self,
-        interface: str | None = None,
-        domain: int = 1,
-        dry_run: bool = False,
-        event_url: str = "http://127.0.0.1:8000/events",
-        send_events: bool = True,
-    ):
-        self.interface = interface
-        self.domain = domain
-        self.dry_run = dry_run
-        self.reporter = EventReporter(endpoint_url=event_url, enabled=send_events)
 
-        self.loco = None
-        self.arm = None
-        self.audio = None
+class ZoneApproach:
+    """区画マーカーへ近づく判断(純粋なクラス。ロボットにもカメラにも触らない)。"""
 
-        if not self.dry_run:
-            self._init_sdk()
+    def __init__(self, vx_max=0.2, vyaw_max=0.3, turn_offset=0.15, arrive_size=0.25,
+                 lost_timeout=3.0, move_timeout=30.0, search=False):
+        self.vx_max = self._clamp("vx", vx_max, VX_LIMIT)
+        self.vyaw_max = self._clamp("vyaw", vyaw_max, VYAW_LIMIT)
+        self.turn_offset = max(float(turn_offset), 1e-6)
+        self.arrive_size = float(arrive_size)
+        self.lost_timeout = float(lost_timeout)
+        self.move_timeout = float(move_timeout)
+        self.search = bool(search)
+        self._t0 = None
+        self._last_seen = None
 
-    def _init_sdk(self) -> None:
-        """Unitree SDK2 チャンネルおよび各サービスクライアントを初期化する。"""
-        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-        from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
-        from r1_clients import R1ArmActionClient, R1LocoClient
+    @staticmethod
+    def _clamp(name, value, limit):
+        value = float(value)
+        clamped = max(0.0, min(value, limit))
+        if clamped != value:
+            print(f"[警告] --{name} {value} は安全上の上限(0〜{limit})の範囲外のため "
+                  f"{clamped} に丸めました。", file=sys.stderr)
+        return clamped
 
-        try:
-            Path("/tmp").mkdir(exist_ok=True)
-        except OSError:
-            pass
+    def fresh(self):
+        return ZoneApproach(self.vx_max, self.vyaw_max, self.turn_offset, self.arrive_size,
+                            self.lost_timeout, self.move_timeout, self.search)
 
-        print(f"[Init] Initializing ChannelFactory (domain={self.domain}, iface={self.interface})...")
-        ChannelFactoryInitialize(self.domain, self.interface)
+    @staticmethod
+    def _out(state, vx, vyaw, reason):
+        return {"state": state, "vx": float(vx), "vy": 0.0, "vyaw": float(vyaw), "reason": reason}
 
-        print("[Init] Connecting to R1 Loco, Arm, and Audio services...")
-        self.loco = R1LocoClient()
-        self.loco.SetTimeout(5.0)
-        self.loco.Init()
+    def step(self, target, now):
+        if self._t0 is None:
+            self._t0 = now
+        if now - self._t0 > self.move_timeout:
+            return self._out("failed", 0.0, 0.0, f"移動開始から {self.move_timeout:g} 秒を超えた")
+        if target is None:
+            ref = self._last_seen if self._last_seen is not None else self._t0
+            lost = now - ref
+            if lost < self.lost_timeout:
+                return self._out("wait", 0.0, 0.0, f"マーカーが見えない({lost:.1f}秒)")
+            if self.search:
+                return self._out("search", 0.0, self.vyaw_max * 0.5, "マーカーを探して旋回")
+            return self._out("failed", 0.0, 0.0,
+                             f"区画マーカーを {self.lost_timeout:g} 秒以上見失った")
+        self._last_seen = now
+        offset, size = float(target["offset"]), float(target["size_ratio"])
+        if size >= self.arrive_size:
+            return self._out("arrived", 0.0, 0.0, f"size_ratio {size:.2f} >= {self.arrive_size:g}")
+        if abs(offset) > self.turn_offset:
+            sign = 1.0 if offset > 0 else -1.0
+            return self._out("turn", 0.0, -sign * self.vyaw_max, f"offset {offset:+.2f} が大きい")
+        vyaw = -offset / self.turn_offset * self.vyaw_max * 0.5
+        return self._out("forward", self.vx_max, vyaw, "前進")
 
-        self.arm = R1ArmActionClient()
-        self.arm.SetTimeout(5.0)
-        self.arm.Init()
 
-        self.audio = AudioClient()
-        self.audio.SetTimeout(5.0)
-        self.audio.Init()
+class DryRunLoco:
+    """ロボットへは何も送らず、送るはずだったコマンドを print するだけ。"""
 
-        # DDS エンドポイントのディスカバリ完了を少し待機
-        time.sleep(1.0)
-        print("[Init] All services ready.")
+    def __init__(self, interval=PRINT_INTERVAL, clock=time.monotonic):
+        self._interval = interval
+        self._clock = clock
+        self._last = None
+        self._last_t = -1e9
 
-    # ------------------------------------------------------------- 音声 (TTS)
-    def speak(self, text: str) -> None:
-        """英語音声 (speaker_id=1) で発話する。"""
-        print(f"[TTS] >> \"{text}\"")
-        if self.dry_run or self.audio is None:
+    def Move(self, vx, vy, vyaw):
+        key = (round(vx, 3), round(vy, 3), round(vyaw, 3))
+        now = self._clock()
+        if key != self._last or now - self._last_t >= self._interval:
+            print(f"[dry-run] Move(vx={vx:.3f}, vy={vy:.3f}, vyaw={vyaw:.3f})", flush=True)
+            self._last, self._last_t = key, now
+        return 0
+
+    def StopMove(self):
+        print("[dry-run] StopMove()", flush=True)
+        return 0
+
+    def WaveHand(self):
+        print("[dry-run] WaveHand()", flush=True)
+        return 0
+
+
+def make_real_loco(domain, interface, init_dds):
+    try:
+        from r1_clients import R1LocoClient
+        if init_dds:
+            from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+    except ImportError as e:
+        raise PickMoveError(
+            f"--execute には unitree_sdk2py が必要ですが import できません({e})。"
+            "pixi 環境(pixi run pick-move ...)で実行してください。") from e
+    if init_dds:
+        Path("/tmp").mkdir(exist_ok=True)
+        ChannelFactoryInitialize(domain, interface)
+    loco = R1LocoClient()
+    loco.SetTimeout(10.0)
+    loco.Init()
+    time.sleep(1.0)
+    return loco
+
+
+SAFETY_NOTICE = """\
+================ 実機にコマンドを送ります(--execute) ================
+ - 2名体制: 実行者とは別に、コントローラーを持った停止担当を置く
+ - 周囲 2m 以上を空ける。初めて動かすときはロボットを吊った状態で試す
+ - 緊急停止: 底面の Emergency Stop、または L2 + B を長押し
+ - Ctrl+C でも StopMove と腕の安全解放が動きます
+ 3秒後に開始します。やめるなら今すぐ Ctrl+C。
+====================================================================="""
+
+
+def _check(label, code):
+    if code not in (0, None):
+        print(f"[警告] {label} がエラーコード {code} を返しました。", file=sys.stderr, flush=True)
+
+
+class _StatusPrinter:
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._key = None
+        self._t = -1e9
+
+    def show(self, zone, d, target):
+        key = (d["state"], round(d["vx"], 3), round(d["vyaw"], 3))
+        now = self._clock()
+        if key == self._key and now - self._t < PRINT_INTERVAL:
             return
-        try:
-            self.audio.TtsMaker(text, 1)
-        except Exception as e:
-            print(f"[TTS Warning] {e}")
-
-    # ------------------------------------------------------------- 移動制御
-    def move_velocity(self, vx: float, vy: float, vyaw: float) -> None:
-        """速度指令を送信する（有効時間 約1秒）。"""
-        if self.dry_run or self.loco is None:
-            return
-        self.loco.Move(vx, vy, vyaw)
-
-    def stop(self) -> None:
-        """安全停止指令を送信する。"""
-        print("[Motion] StopMove called.")
-        if self.dry_run or self.loco is None:
-            return
-        self.loco.StopMove()
-
-    def walk(self, vx: float, vy: float, vyaw: float, duration: float) -> None:
-        """指定秒数の間、速度コマンドを 0.2 秒周期で再送して安全に移動させる。"""
-        print(f"[Motion] Walk vx={vx:+.2f} vy={vy:+.2f} vyaw={vyaw:+.2f} for {duration:.1f}s")
-        if self.dry_run:
-            time.sleep(min(duration, 1.0) if duration > 0 else 0)  # テスト短縮用
-            return
-
-        t_end = time.time() + duration
-        while time.time() < t_end:
-            self.move_velocity(vx, vy, vyaw)
-            time.sleep(0.2)
-        self.stop()
-
-    # ------------------------------------------------------------- 腕動作
-    def execute_arm_action(self, action_id: int, action_name: str, duration: float = 2.0) -> None:
-        """腕プリセット動作を実行する。動作中は歩行しないこと。"""
-        print(f"[Arm] Execute action ID {action_id}: {action_name}")
-        if self.dry_run or self.arm is None:
-            time.sleep(0.5)
-            return
-
-        try:
-            ret = self.arm.ExecuteAction(action_id)
-            if ret != 0:
-                print(f"[Arm Warning] ExecuteAction returned code {ret}")
-            time.sleep(duration)
-        except Exception as e:
-            print(f"[Arm Error] {e}")
-
-    def point_zone(self) -> None:
-        """右腕を前に伸ばして区画を指し示す (ID 31: extend_right_arm_forward)。"""
-        self.execute_arm_action(31, "extend_right_arm_forward (Pointing zone)", duration=1.5)
-
-    def wave_hand(self) -> None:
-        """完了表現として胸の前で手を振る (ID 25: wave_under_head)。"""
-        self.execute_arm_action(25, "wave_under_head (Task Completed)", duration=2.5)
-
-    def release_arm(self) -> None:
-        """腕の保持を解除し、初期姿勢に戻す (ID 99: release_arm)。"""
-        self.execute_arm_action(99, "release_arm (Return to home pose)", duration=1.0)
-
-    # ------------------------------------------------------------- メインシーケンス
-    def go_to(self, zone: str, box_id: str = "B001", return_home: bool = False) -> None:
-        """目的地（区画A / B / C / HOME）へ移動し、腕で指し示して完了を報告する。
-
-        Args:
-            zone: 目標区画 ("A", "B", "C", "HOME")
-            box_id: 箱ID (例: "B001")
-            return_home: 完了後に初期位置（スタート地点）へ戻るかどうか
-        """
-        zone_norm = zone.strip().upper()
-        if zone_norm.startswith("ZONE_"):
-            zone_clean = zone_norm.replace("ZONE_", "")
-        else:
-            zone_clean = zone_norm
-
-        print(f"\n=======================================================")
-        print(f"[*] Mission Start: Moving Box '{box_id}' to Zone '{zone_clean}'")
-        print(f"=======================================================")
-
-        t_start = time.time()
-
-        # 1. 移動開始イベント送信 & 発話 (docs/log_schema.md 準拠)
-        self.reporter.send(
-            "moving",
-            box_id=box_id,
-            zone=zone_clean if zone_clean in ("A", "B", "C") else None,
-            detail=f"区画{zone_clean}へ移動",
-            data={"from": "start", "to": zone_clean},
-        )
-        self.speak(f"Moving box {box_id} to zone {zone_clean}.")
-        time.sleep(0.5)
-
-        try:
-            # 2. 区画ごとの移動軌道（速度は安全のため 0.25 m/s 程度に設定）
-            if zone_clean == "A":
-                # 区画 A: 直進
-                print("[Mission] Route A: Move forward 2.5 meters (approx 8.0s)")
-                self.walk(vx=0.25, vy=0.0, vyaw=0.0, duration=4.0)
-
-            elif zone_clean == "B":
-                # 区画 B: 直進 ➜ 右旋回 ➜ 前進
-                print("[Mission] Route B: Forward -> Turn Right -> Forward")
-                self.walk(vx=0.25, vy=0.0, vyaw=0.0, duration=3.0)
-                self.walk(vx=0.0, vy=0.0, vyaw=-0.5, duration=2.0)
-                self.walk(vx=0.25, vy=0.0, vyaw=0.0, duration=2.0)
-
-            elif zone_clean == "C":
-                # 区画 C: 直進 ➜ 左旋回 ➜ 前進
-                print("[Mission] Route C: Forward -> Turn Left -> Forward")
-                self.walk(vx=0.25, vy=0.0, vyaw=0.0, duration=3.0)
-                self.walk(vx=0.0, vy=0.0, vyaw=0.5, duration=2.0)
-                self.walk(vx=0.25, vy=0.0, vyaw=0.0, duration=2.0)
-
-            elif zone_clean == "HOME":
-                # スタート地点へ後退
-                print("[Mission] Route HOME: Returning to base")
-                self.walk(vx=-0.25, vy=0.0, vyaw=0.0, duration=3.0)
-
-            else:
-                # 未知の区画: エラーイベント送信 (誤出荷アラート対象 UNKNOWN_QR)
-                self.reporter.send(
-                    "error",
-                    box_id=box_id,
-                    zone=None,
-                    detail=f"想定外QR: 未定義区画 {zone_clean}",
-                    error={"code": "UNKNOWN_QR", "message": f"zone '{zone_clean}' is not defined"},
-                    data={"target": zone_clean},
-                )
-                self.speak("Error. Unknown destination zone.")
-                return
-
-            # 3. 到着
-            self.stop()
-            duration_ms = int((time.time() - t_start) * 1000)
-            print(f"[Mission] Arrived at Zone {zone_clean}.")
-            self.reporter.send(
-                "arrived",
-                box_id=box_id,
-                zone=zone_clean if zone_clean in ("A", "B", "C") else None,
-                detail=f"腕で指し示し完了 (所要 {duration_ms / 1000:.1f}s)",
-                data={"duration_ms": duration_ms, "gesture": "point"},
-            )
-            self.speak(f"Arrived at zone {zone_clean}. Sorting completed.")
-            time.sleep(1.0)
-
-            # 4. 腕アクション（区画の指し示し ➜ 解除 ➜ 手振り ➜ 姿勢解除）
-            # ※ R1 仕様: 姿勢保持アクション(ID 31等)の後に別アクションを呼ぶと 7401 エラーになるため、
-            # 連続動作の間には必ず release_arm(ID 99) を挟む。
-            print("[Mission] Performing presentation arm gestures...")
-            self.point_zone()
-            time.sleep(1.0)
-            self.release_arm()
-            time.sleep(0.5)
-            self.wave_hand()
-            time.sleep(0.5)
-            self.release_arm()
-
-            # 5. オプション: スタート地点への帰還
-            if return_home:
-                print("[Mission] Returning to start position...")
-                self.speak("Returning to start position.")
-                # 簡易的な反転・復帰シーケンス（現場レイアウトに合わせて調整可能）
-                self.walk(vx=0.0, vy=0.0, vyaw=1.0, duration=3.14)  # 180度旋回
-                self.walk(vx=0.25, vy=0.0, vyaw=0.0, duration=4.0)
-                self.walk(vx=0.0, vy=0.0, vyaw=1.0, duration=3.14)
-                self.stop()
-
-        finally:
-            # 異常終了時でも必ず停止と腕解除を行う
-            self.stop()
-            self.release_arm()
-            print(f"[*] Mission Finished safely.\n")
+        self._key, self._t = key, now
+        seen = (f"offset={target['offset']:+.2f} size_ratio={target['size_ratio']:.3f}"
+                if target else "offset=- size_ratio=-")
+        print(f"[区画 {zone}] {d['state']:<7} {seen} -> vx={d['vx']:.2f} vy={d['vy']:.2f} "
+              f"vyaw={d['vyaw']:+.2f} ({d['reason']})", flush=True)
 
 
-def interactive_loop(controller: PickRobotController) -> None:
-    """現場やテストで即座に動作確認できる対話型コマンドループ。"""
-    print("\n--- PickRobotController Interactive Mode ---")
-    print("Commands:")
-    print("  a      : Go to Zone A")
-    print("  b      : Go to Zone B")
-    print("  c      : Go to Zone C")
-    print("  home   : Return to start")
-    print("  point  : Test Pointing Arm (ID 31)")
-    print("  wave   : Test Waving Arm (ID 25)")
-    print("  release: Release Arm to Home Pose (ID 99)")
-    print("  stop   : Emergency StopMove")
-    print("  q      : Quit")
-    print("--------------------------------------------\n")
-
+def _approach(rec, loco, zone, appr, deadline, clock, sleep):
+    printer = _StatusPrinter(clock)
+    next_t = clock()
     while True:
-        try:
-            cmd = input("Command [a/b/c/home/point/wave/release/stop/q] > ").strip().lower()
-            if not cmd:
-                continue
-            if cmd == "q":
-                break
-            elif cmd == "a":
-                controller.go_to("A", "BOX-DEBUG")
-            elif cmd == "b":
-                controller.go_to("B", "BOX-DEBUG")
-            elif cmd == "c":
-                controller.go_to("C", "BOX-DEBUG")
-            elif cmd == "home":
-                controller.go_to("HOME", "BOX-DEBUG")
-            elif cmd == "point":
-                controller.point_zone()
-            elif cmd == "wave":
-                controller.wave_hand()
-            elif cmd == "release":
-                controller.release_arm()
-            elif cmd == "stop":
-                controller.stop()
+        now = clock()
+        if deadline is not None and now >= deadline:
+            return "timeout", "--max-seconds に達した"
+        tgt = rec.get_target(zone)
+        d = appr.step(tgt, now)
+        printer.show(zone, d, tgt)
+        if d["state"] in ("arrived", "failed"):
+            return d["state"], d["reason"]
+        _check("Move", loco.Move(d["vx"], d["vy"], d["vyaw"]))
+        next_t += PERIOD
+        sleep(max(0.0, next_t - clock()))
+
+
+def run(args, source=None, loco=None, arm=None, *, clock=time.monotonic, sleep=time.sleep):
+    base = ZoneApproach(args.vx, args.vyaw, args.turn_offset, args.arrive_size,
+                        args.lost_timeout, args.move_timeout, args.search)
+    zone_fixed = args.zone.strip().upper() if args.zone else None
+    own_source = source is None
+    if own_source:
+        source = source_from_args(args)
+    rec = None
+    events = []
+    try:
+        rec = recognizer_from_args(args, source)
+        if zone_fixed and zone_fixed not in rec.zones:
+            raise PickMoveError(f"--zone {zone_fixed} が --zones {sorted(rec.zones)} に含まれていません。")
+        if args.execute:
+            print(SAFETY_NOTICE, flush=True)
+        if loco is None:
+            if args.execute:
+                loco = make_real_loco(args.domain, args.interface, init_dds=args.source != "videohub")
             else:
-                print(f"Unknown command: {cmd}")
+                print("[dry-run] ロボットにはコマンドを送りません(実機へ送るには --execute)。", flush=True)
+                loco = DryRunLoco()
+        if arm is None:
+            arm = ArmController(
+                mode=getattr(args, "arm_mode", "preset"),
+                execute=args.execute,
+                custom_grab=getattr(args, "custom_grab", "grab_box"),
+                custom_release=getattr(args, "custom_release", "release_arm"),
+                custom_wait=getattr(args, "custom_wait", 3.0),
+                clamp_roll=getattr(args, "clamp_roll", 0.15),
+                open_roll=getattr(args, "open_roll", 0.45),
+                shoulder_pitch=getattr(args, "shoulder_pitch", -0.35),
+                elbow_angle=getattr(args, "elbow_angle", 0.50),
+            )
+        if args.execute:
+            sleep(3.0)
+        deadline = clock() + args.max_seconds if args.max_seconds else None
+        rec.start()
+        try:
+            while deadline is None or clock() < deadline:
+                if zone_fixed:
+                    goal = {"box_id": None, "zone": zone_fixed}
+                else:
+                    goal = rec.pop_box(timeout=PERIOD)
+                    if goal is None:
+                        continue
+                zone = goal["zone"]
+                print(f"[箱] {goal['box_id']} を把持して区画 {zone} へ運ぶ" if goal["box_id"]
+                      else f"[区画 {zone}] 箱を待たず直接向かう", flush=True)
+
+                arm.grab()
+
+                ev = make_event("moving", goal["box_id"], zone, detail=f"区画 {zone} へ移動開始",
+                                run_id=rec.run_id, source="control",
+                                data={"from": "start", "to": zone, "arm_mode": arm.mode})
+                post_event(args.server, ev)
+                events.append(ev)
+
+                t_move = clock()
+                state, reason = _approach(rec, loco, zone, base.fresh(), deadline, clock, sleep)
+                _check("StopMove", loco.StopMove())
+
+                if state == "arrived":
+                    arm.release()
+                    if args.gesture == "wave":
+                        _check("WaveHand", loco.WaveHand())
+                    ev = make_event("arrived", goal["box_id"], zone, detail=f"区画 {zone} に到着・配置完了",
+                                    run_id=rec.run_id, source="control",
+                                    data={"duration_ms": int((clock() - t_move) * 1000),
+                                          "gesture": args.gesture, "arm_mode": arm.mode})
+                elif state == "failed":
+                    arm.release()
+                    ev = make_event("error", goal["box_id"], zone, detail=f"移動失敗: {reason}",
+                                    run_id=rec.run_id, source="control",
+                                    error={"code": "MOVE_FAILED", "message": reason})
+                else:
+                    print(f"[中断] {reason}", flush=True)
+                    break
+
+                post_event(args.server, ev)
+                events.append(ev)
+                if args.once or zone_fixed:
+                    break
         except KeyboardInterrupt:
-            print("\nInterrupted.")
-            controller.stop()
-            break
+            print("中断しました(停止・解放コマンドを送ります)。", file=sys.stderr)
+            raise
+        finally:
+            try:
+                loco.StopMove()
+            except Exception as e:
+                print(f"[警告] 最終の StopMove に失敗: {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
+            arm.emergency_release()
+    finally:
+        if rec is not None:
+            rec.stop(close_source=own_source)
+        elif own_source:
+            source.close()
+    return events
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Unitree R1 Pick & Place / Sorting Controller (Role A)")
-    parser.add_argument("-z", "--zone", type=str, default=None, help="Target zone (A, B, C, HOME)")
-    parser.add_argument("-b", "--box", type=str, default="B001", help="Box ID (default: B001)")
-    parser.add_argument("--return-home", action="store_true", help="Automatically return to start position")
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="箱QR確定→腕把持→区画マーカーへ接近→停止・解放。既定は dry-run(--execute で実機へ送信)")
+    add_source_args(parser)
+    add_recognizer_args(parser)
+    parser.add_argument("--execute", action="store_true",
+                        help="実機へコマンドを送る(付けなければ dry-run)")
+    parser.add_argument("--vx", type=float, default=0.2, help=f"前進速度 m/s(上限 {VX_LIMIT} に丸める)")
+    parser.add_argument("--vyaw", type=float, default=0.3, help=f"旋回速度 rad/s(上限 {VYAW_LIMIT} に丸める)")
+    parser.add_argument("--turn-offset", type=float, default=0.15, help="旋回を始める |offset| の閾値")
+    parser.add_argument("--arrive-size", type=float, default=0.25, help="到着とみなす size_ratio の閾値")
+    parser.add_argument("--lost-timeout", type=float, default=3.0, help="マーカーを見失って待つ秒数")
+    parser.add_argument("--move-timeout", type=float, default=30.0, help="1箱あたりの移動の制限秒数")
+    parser.add_argument("--search", action="store_true", help="見失ったらゆっくり旋回して探す")
+    parser.add_argument("--gesture", choices=("none", "wave"), default="none",
+                        help="到着後の動作(wave=手を振る)")
+    parser.add_argument("--once", action="store_true", help="1箱処理したら終了")
+    parser.add_argument("--max-seconds", type=float, default=None, help="全体の制限秒数(テスト用)")
+    parser.add_argument("--zone", type=str, default=None,
+                        help="箱のQRを待たず、この zone へ直接向かう(移動だけの単体確認用)")
 
-    # 通信・環境設定
-    parser.add_argument("-i", "--interface", default=None, help="Network interface (default: auto, use 'Ethernet' on robot)")
-    parser.add_argument("-d", "--domain", type=int, default=1, help="DDS domain (0: real robot, 1: mock)")
-    parser.add_argument("--dry-run", action="store_true", help="Run without DDS / robot connection (offline syntax/logic test)")
-    parser.add_argument("--event-url", type=str, default="http://127.0.0.1:8000/events", help="Dashboard event endpoint URL")
+    parser.add_argument("--arm-mode", choices=("preset", "custom", "sdk", "none"), default="preset",
+                        help="腕制御モード: preset(15->17->99), custom(ティーチング), sdk(rt/arm_sdk), none(腕なし)")
+    parser.add_argument("--custom-grab", type=str, default="grab_box",
+                        help="customモード時の把持アクション名")
+    parser.add_argument("--custom-release", type=str, default="release_arm",
+                        help="customモード時の解放アクション名(または release_arm)")
+    parser.add_argument("--custom-wait", type=float, default=3.0,
+                        help="customモード時のアクション完了待機秒数")
+    parser.add_argument("--clamp-roll", type=float, default=0.15,
+                        help="sdkモード時の把持肩ロール角(rad: 小さいほど狭く挟む)")
+    parser.add_argument("--open-roll", type=float, default=0.45,
+                        help="sdkモード時の開放肩ロール角(rad: 大きいほど広く開く)")
+    parser.add_argument("--shoulder-pitch", type=float, default=-0.35,
+                        help="sdkモード時の肩ピッチ角(rad: 負で腕を前に上げる)")
+    parser.add_argument("--elbow-angle", type=float, default=0.50,
+                        help="sdkモード時の肘角度(rad)")
+    return parser
 
-    # デバッグ用モード
-    parser.add_argument("--interactive", action="store_true", help="Start interactive CLI command mode")
 
-    args = parser.parse_args()
-
-    controller = PickRobotController(
-        interface=args.interface,
-        domain=args.domain,
-        dry_run=args.dry_run,
-        event_url=args.event_url,
-    )
-
-    if args.interactive:
-        interactive_loop(controller)
-    elif args.zone:
-        controller.go_to(zone=args.zone, box_id=args.box, return_home=args.return_home)
-    else:
-        print("No zone specified. Running default demo with Zone A (dry-run mode if not connected)...")
-        # zone が未指定の場合はデフォルトで Zone A をテスト
-        controller.go_to(zone="A", box_id=args.box, return_home=args.return_home)
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    args = build_parser().parse_args()
+    try:
+        run(args)
+    except (CameraError, PickMoveError) as e:
+        print(f"[エラー] {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
